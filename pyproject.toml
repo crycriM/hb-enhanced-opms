@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opms"
+version = "0.1.0"
+description = "Hummingbot-based execution body: controllers, executors, and Gateway bridge wired to the mm_core brain"
+requires-python = ">=3.10.12,<3.13"
+dependencies = [
+    "mm_core",
+    "perp_bot",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0", "pytest-asyncio>=1.4.0"]
+# hummingbot is NOT pip-installable from PyPI (isolated sdist build fails on
+# Cython .pyx globbing). Install via `conda env create -f
+# <hummingbot-checkout>/setup/environment.yml`, then `pip install -e .` here
+# inside that conda env. See docs/hummingbot-migration-plan.md §4.
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
