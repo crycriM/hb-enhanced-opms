@@ -25,6 +25,15 @@ class OrderSpec:
     urgency: str = "normal"
 
 
+@dataclass
+class ExecutionRequest:
+    """Routing request for the non-quoting execution path."""
+    side: str                          # "buy" | "sell"
+    amount: float
+    urgency: str                       # "passive" | "normal" | "immediate" | "emergency"
+    reduce_only: bool = True
+
+
 class InProcessClient:
     """Duck-types perp_bot.opms_client.OpmsClient's callback/query surface,
     but keeps everything in-process instead of doing HTTP/websocket I/O —
@@ -66,11 +75,33 @@ class InProcessClient:
         return self._positions
 
 
+def intent_is_quoting(intent: ExecIntent | None) -> bool:
+    return intent is not None and intent.quote is not None
+
+
+def intent_to_execution_request(intent: ExecIntent | None) -> ExecutionRequest | None:
+    if intent is None:
+        return None
+    if intent.quote is not None:
+        return None
+    current = intent.current_inventory or 0.0
+    target = intent.target_inventory
+    gap = target - current
+    if abs(gap) < 1e-12:
+        return None
+    return ExecutionRequest(
+        side="buy" if gap > 0 else "sell",
+        amount=abs(gap),
+        urgency=intent.urgency,
+        reduce_only=True,
+    )
+
+
 def intent_to_order_specs(intent: ExecIntent | None) -> list[OrderSpec]:
     """Map the keeper's ExecIntent onto plain order instructions.
 
-    Every non-QUOTE/WIDEN decision means "cancel resting quotes"; DE_RISK and
-    EMERGENCY_EXIT additionally need a reduce-only order back to flat.
+    Only used by the quoting path (intent.quote present).  Non-quoting
+    intents are routed through intent_to_execution_request instead.
     """
     if intent is None:
         return []
@@ -89,17 +120,4 @@ def intent_to_order_specs(intent: ExecIntent | None) -> list[OrderSpec]:
                                     urgency=intent.urgency))
         return specs or [OrderSpec(cancel_all=True)]
 
-    current = intent.current_inventory or 0.0
-    target = intent.target_inventory
-    gap = target - current
-    if abs(gap) < 1e-12:
-        return [OrderSpec(cancel_all=True)]
-
-    return [OrderSpec(
-        cancel_all=True,
-        side="buy" if gap > 0 else "sell",
-        price=None,  # market/executor-managed — de-risk and emergency exits chase, not rest
-        amount=abs(gap),
-        reduce_only=True,
-        urgency=intent.urgency,
-    )]
+    return [OrderSpec(cancel_all=True)]

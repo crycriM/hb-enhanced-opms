@@ -16,7 +16,7 @@ from perp_bot.config import PerpPairConfig
 from perp_bot.keeper import Keeper
 from perp_bot.opms_client import Position
 
-from opms.controllers.perp_mm_bridge import InProcessClient, OrderSpec, intent_to_order_specs
+from opms.controllers.generic.perp_mm_bridge import InProcessClient, OrderSpec, intent_to_order_specs
 
 
 class _StaticPositionClient:
