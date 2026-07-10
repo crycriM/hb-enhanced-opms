@@ -16,7 +16,14 @@ from perp_bot.config import PerpPairConfig
 from perp_bot.keeper import Keeper
 from perp_bot.opms_client import Position
 
-from opms.controllers.generic.perp_mm_bridge import InProcessClient, OrderSpec, intent_to_order_specs
+from opms.controllers.generic.perp_mm_bridge import (
+    ExecutionRequest,
+    InProcessClient,
+    OrderSpec,
+    intent_is_quoting,
+    intent_to_execution_request,
+    intent_to_order_specs,
+)
 
 
 class _StaticPositionClient:
@@ -106,13 +113,73 @@ def test_intent_to_order_specs_quote():
 def test_intent_to_order_specs_de_risk():
     from mm_core.contracts import ExecIntent
 
+    # Non-quoting intents no longer produce OrderSpec with side/amount —
+    # they are routed through intent_to_execution_request instead.
     intent = ExecIntent(venue="hyperliquid", coin="BTC", target_inventory=0.0,
                          current_inventory=5.0, quote=None, urgency="normal",
                          strategy_hint="passive_aggressive")
     specs = intent_to_order_specs(intent)
-    assert specs == [OrderSpec(cancel_all=True, side="sell", price=None, amount=5.0,
-                                reduce_only=True, urgency="normal")]
+    assert specs == [OrderSpec(cancel_all=True)]
 
 
 def test_intent_to_order_specs_none():
     assert intent_to_order_specs(None) == []
+
+
+def test_intent_is_quoting_true():
+    from mm_core.contracts import ExecIntent, QuoteSpec
+
+    intent = ExecIntent(venue="hl", coin="BTC", target_inventory=0.0,
+                         quote=QuoteSpec(bid_price=99.0, ask_price=101.0, bid_size=1.0, ask_size=1.0))
+    assert intent_is_quoting(intent) is True
+
+
+def test_intent_is_quoting_false():
+    from mm_core.contracts import ExecIntent
+
+    intent = ExecIntent(venue="hl", coin="BTC", target_inventory=0.0,
+                         current_inventory=5.0, quote=None, urgency="passive")
+    assert intent_is_quoting(intent) is False
+
+
+def test_intent_is_quoting_none():
+    assert intent_is_quoting(None) is False
+
+
+def test_intent_to_execution_request_sell():
+    from mm_core.contracts import ExecIntent
+
+    intent = ExecIntent(venue="hl", coin="BTC", target_inventory=0.0,
+                         current_inventory=5.0, quote=None, urgency="passive")
+    req = intent_to_execution_request(intent)
+    assert isinstance(req, ExecutionRequest)
+    assert req.side == "sell"
+    assert req.amount == pytest.approx(5.0)
+    assert req.urgency == "passive"
+    assert req.reduce_only is True
+
+
+def test_intent_to_execution_request_buy():
+    from mm_core.contracts import ExecIntent
+
+    intent = ExecIntent(venue="hl", coin="BTC", target_inventory=10.0,
+                         current_inventory=5.0, quote=None, urgency="normal")
+    req = intent_to_execution_request(intent)
+    assert req.side == "buy"
+    assert req.amount == pytest.approx(5.0)
+
+
+def test_intent_to_execution_request_zero_gap():
+    from mm_core.contracts import ExecIntent
+
+    intent = ExecIntent(venue="hl", coin="BTC", target_inventory=0.0,
+                         current_inventory=0.0, quote=None, urgency="normal")
+    assert intent_to_execution_request(intent) is None
+
+
+def test_intent_to_execution_request_quote_present():
+    from mm_core.contracts import ExecIntent, QuoteSpec
+
+    intent = ExecIntent(venue="hl", coin="BTC", target_inventory=0.0,
+                         quote=QuoteSpec(bid_price=99.0, ask_price=101.0, bid_size=1.0, ask_size=1.0))
+    assert intent_to_execution_request(intent) is None

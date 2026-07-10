@@ -61,6 +61,7 @@ class PriceType(Enum):
 class PositionAction(Enum):
     OPEN = "open"
     NIL = "nil"
+    CLOSE = "close"
 
 
 class MarketEvent:
@@ -152,6 +153,41 @@ def _mk(**attrs):
     return m
 
 
+class ExecutionStrategy(Enum):
+    MARKET = "MARKET"
+    LIMIT_MAKER = "LIMIT_MAKER"
+
+
+class TwapExecutorConfig:
+    """Minimal stub for TwapExecutorConfig — enough to check .type and .duration_seconds."""
+    type = "twap_executor"
+    def __init__(self, timestamp, connector_name, trading_pair, side, total_amount_base,
+                 duration_seconds=120, leverage=1):
+        self.timestamp = timestamp
+        self.connector_name = connector_name
+        self.trading_pair = trading_pair
+        self.side = side
+        self.total_amount_base = total_amount_base
+        self.duration_seconds = duration_seconds
+        self.leverage = leverage
+
+
+class OrderExecutorConfig:
+    """Minimal stub for OrderExecutorConfig — enough to check .type and .execution_strategy."""
+    type = "order_executor"
+    def __init__(self, timestamp, trading_pair, connector_name, side, amount, price,
+                 execution_strategy, position_action, leverage=1):
+        self.timestamp = timestamp
+        self.trading_pair = trading_pair
+        self.connector_name = connector_name
+        self.side = side
+        self.amount = amount
+        self.price = price
+        self.execution_strategy = execution_strategy
+        self.position_action = position_action
+        self.leverage = leverage
+
+
 _HB_STUBS = {
     "hummingbot": MagicMock(),
     "hummingbot.connector": MagicMock(),
@@ -160,6 +196,7 @@ _HB_STUBS = {
     "hummingbot.core": MagicMock(),
     "hummingbot.core.data_type": MagicMock(),
     "hummingbot.core.data_type.common": _mk(
+        ExecutionStrategy=ExecutionStrategy,
         OrderType=OrderType,
         PositionAction=PositionAction,
         PriceType=PriceType,
@@ -185,12 +222,22 @@ _HB_STUBS = {
     "hummingbot.strategy": MagicMock(),
     "hummingbot.strategy.strategy_v2_base": _mk(StrategyV2Base=object),
     "hummingbot.strategy_v2": MagicMock(),
+    "hummingbot.strategy_v2.controllers": MagicMock(),
+    "hummingbot.strategy_v2.controllers.controller_base": _mk(
+        ControllerBase=object,
+        ControllerConfigBase=MagicMock,
+    ),
     "hummingbot.strategy_v2.executors": MagicMock(),
     "hummingbot.strategy_v2.executors.data_types": _mk(ExecutorConfigBase=MagicMock),
     "hummingbot.strategy_v2.executors.executor_base": _mk(ExecutorBase=ExecutorBase),
+    "hummingbot.strategy_v2.executors.twap_executor": MagicMock(),
+    "hummingbot.strategy_v2.executors.twap_executor.data_types": _mk(TwapExecutorConfig=TwapExecutorConfig),
+    "hummingbot.strategy_v2.executors.order_executor": MagicMock(),
+    "hummingbot.strategy_v2.executors.order_executor.data_types": _mk(OrderExecutorConfig=OrderExecutorConfig),
     "hummingbot.strategy_v2.models": MagicMock(),
     "hummingbot.strategy_v2.models.base": _mk(RunnableStatus=RunnableStatus),
     "hummingbot.strategy_v2.models.executors": _mk(CloseType=CloseType, TrackedOrder=TrackedOrder),
+    "hummingbot.strategy_v2.models.executor_actions": MagicMock(),
     "hummingbot.client": MagicMock(),
     "hummingbot.client.settings": MagicMock(),
     "base58": MagicMock(),

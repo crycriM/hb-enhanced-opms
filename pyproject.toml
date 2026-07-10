@@ -10,6 +10,7 @@ requires-python = ">=3.10.12,<3.13"
 dependencies = [
     "mm_core",
     "perp_bot",
+    "dlmm_bot",
 ]
 
 [project.optional-dependencies]
