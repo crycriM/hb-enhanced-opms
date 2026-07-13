@@ -16,6 +16,7 @@ from dlmm_bot.risk_dlmm import PairType
 from dlmm_bot.config import DLMMConfig
 
 from opms.controllers.generic.dlmm_controller import DLMMController, DLMMControllerConfig
+from hummingbot.core.data_type.common import TradeType
 
 
 @pytest.fixture
@@ -176,3 +177,213 @@ class TestSharedBookWrite:
         })()
 
         await DLMMController.update_processed_data(fake_self)  # must not raise
+
+
+class TestDLMMHedgeFullLoop:
+    """Integration test for the full C2 loop: DLMMController writes
+    inventory state into SharedRiskBook → HedgeController reads it →
+    emits PA executor actions on the perp connector.  Both controllers
+    share the same book key (parity gate §5.4 / acceptance §10)."""
+
+    @pytest.fixture
+    def shared_book(self):
+        from opms.controllers.generic.shared_risk_book import SharedRiskBook, _REGISTRY
+        _REGISTRY.clear()
+        book = SharedRiskBook()
+        _REGISTRY["dlmm_hedge_test"] = book
+        yield book
+        _REGISTRY.clear()
+
+    def _make_hedge_self(self, shared_book, perp_position=0.0):
+        """Build a fake self for HedgeController that works with the real
+        dlmm_bot.hedge.HedgeController engine."""
+        from dlmm_bot.hedge import HedgeController as DlmmHedgeController, HedgeConfig
+        from opms.controllers.generic.hedge_controller import HedgeController
+
+        hc = DlmmHedgeController(cfg=HedgeConfig(
+            tau_h=3600.0, tau_min=900.0, tau_max=7200.0,
+            sigma_ref=0.5, deadband_base_bps=10.0, per_trade_cost_bps=2.0,
+            delta_cap_bps=200.0, cube_root_constant=1.0, deadband_base=0.0,
+            venue="hyperliquid_perpetual", coin="SOL", enabled=True,
+        ))
+
+        config = MagicMock()
+        config.perp_connector = "hyperliquid_perpetual"
+        config.perp_trading_pair = "SOL-USD"
+        config.shared_book_key = "dlmm_hedge_test"
+        config.refresh_interval = 5.0
+        config.id = "hedge_1"
+
+        md_provider = MagicMock()
+        md_provider.time.return_value = 1700000000.0
+
+        positions = []
+        if perp_position != 0:
+            pos = MagicMock()
+            pos.connector_name = "hyperliquid_perpetual"
+            pos.trading_pair = "SOL-USD"
+            pos.amount = abs(perp_position)
+            pos.side = TradeType.BUY if perp_position > 0 else TradeType.SELL
+            positions = [pos]
+
+        return type("Fake", (), {
+            "_shared_book": shared_book,
+            "_hedge": hc,
+            "config": config,
+            "positions_held": positions,
+            "market_data_provider": md_provider,
+            "_current_perp_position": HedgeController._current_perp_position,
+            "update_processed_data": HedgeController.update_processed_data,
+            "determine_executor_actions": HedgeController.determine_executor_actions,
+        })()
+
+    @pytest.mark.asyncio
+    async def test_dlmm_writes_hedge_reads_book_populated(self, mock_keeper, shared_book):
+        """DLMM writes inventory → Hedge reads from same book key."""
+        from dlmm_bot.keeper import CycleRecord
+        from opms.controllers.generic.dlmm_controller import DLMMController
+
+        mock_keeper._cycle = AsyncMock()
+        mock_keeper._decision_log.append(CycleRecord(
+            ts=1700000000.0, active_bin=100, mid=150.0,
+            regime_half_life=0.0, regime_hurst=0.0, regime_trending=False,
+            decision="quote", urgency="normal", action="hold",
+            inventory_base=2.0, inventory_quote=300.0,
+            r_reservation=150.0, half_spread=0.1,
+            ladder_center=100, ladder_levels=5,
+            refresh_needed=False, refresh_reason="",
+            net_delta=1.5, sigma=0.25,
+        ))
+
+        dlmm_self = type("Fake", (), {
+            "keeper": mock_keeper,
+            "_shared_book": shared_book,
+            "update_processed_data": DLMMController.update_processed_data,
+        })()
+
+        await DLMMController.update_processed_data(dlmm_self)
+        assert shared_book.dlmm_net_delta == 1.5
+
+        hedge_self = self._make_hedge_self(shared_book)
+        from opms.controllers.generic.hedge_controller import HedgeController
+        await HedgeController.update_processed_data(hedge_self)
+
+        assert shared_book.hedge_action != ""
+        assert shared_book.last_hedge_ts == 1700000000.0
+
+    @pytest.mark.asyncio
+    async def test_hedge_emits_pa_action_when_rehedge(self, mock_keeper, shared_book):
+        """Positive net_delta with no existing perp position → hedge emits
+        a SELL executor action (short delta to offset long inventory)."""
+        from dlmm_bot.keeper import CycleRecord
+        from opms.controllers.generic.dlmm_controller import DLMMController
+        from opms.controllers.generic.hedge_controller import HedgeController
+
+        mock_keeper._cycle = AsyncMock()
+        mock_keeper._decision_log.append(CycleRecord(
+            ts=1700000000.0, active_bin=100, mid=150.0,
+            regime_half_life=0.0, regime_hurst=0.0, regime_trending=False,
+            decision="quote", urgency="normal", action="hold",
+            inventory_base=5.0, inventory_quote=750.0,
+            r_reservation=150.0, half_spread=0.1,
+            ladder_center=100, ladder_levels=5,
+            refresh_needed=False, refresh_reason="",
+            net_delta=5.0, sigma=0.30,
+        ))
+
+        dlmm_self = type("Fake", (), {
+            "keeper": mock_keeper,
+            "_shared_book": shared_book,
+            "update_processed_data": DLMMController.update_processed_data,
+        })()
+
+        await DLMMController.update_processed_data(dlmm_self)
+        shared_book.dlmm_sigma = 0.30
+
+        hedge_self = self._make_hedge_self(shared_book, perp_position=0.0)
+        hedge_self._hedge.evaluate = MagicMock(return_value=("rehedge", 5.0, None))
+        await HedgeController.update_processed_data(hedge_self)
+
+        actions = HedgeController.determine_executor_actions(hedge_self)
+        assert len(actions) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_trade_emits_no_actions(self, mock_keeper, shared_book):
+        """When hedge evaluates to no_trade, no executor actions emitted."""
+        from dlmm_bot.keeper import CycleRecord
+        from opms.controllers.generic.dlmm_controller import DLMMController
+        from opms.controllers.generic.hedge_controller import HedgeController
+
+        mock_keeper._cycle = AsyncMock()
+        mock_keeper._decision_log.append(CycleRecord(
+            ts=1700000000.0, active_bin=100, mid=150.0,
+            regime_half_life=0.0, regime_hurst=0.0, regime_trending=False,
+            decision="quote", urgency="normal", action="hold",
+            inventory_base=0.1, inventory_quote=15.0,
+            r_reservation=150.0, half_spread=0.1,
+            ladder_center=100, ladder_levels=5,
+            refresh_needed=False, refresh_reason="",
+            net_delta=0.0, sigma=0.25,
+        ))
+
+        dlmm_self = type("Fake", (), {
+            "keeper": mock_keeper,
+            "_shared_book": shared_book,
+            "update_processed_data": DLMMController.update_processed_data,
+        })()
+
+        await DLMMController.update_processed_data(dlmm_self)
+
+        hedge_self = self._make_hedge_self(shared_book, perp_position=0.0)
+        hedge_self._hedge.evaluate = MagicMock(return_value=("no_trade", 0.0, None))
+        await HedgeController.update_processed_data(hedge_self)
+
+        actions = HedgeController.determine_executor_actions(hedge_self)
+        assert len(actions) == 0
+
+    @pytest.mark.asyncio
+    async def test_hedge_with_existing_perp_position(self, mock_keeper, shared_book):
+        """Already short 3.0, DLMM net delta 5.0 → hedge delta = -5.0 - (-3.0) = -2.0 → SELL for remaining."""
+        from dlmm_bot.keeper import CycleRecord
+        from opms.controllers.generic.dlmm_controller import DLMMController
+        from opms.controllers.generic.hedge_controller import HedgeController
+
+        mock_keeper._cycle = AsyncMock()
+        mock_keeper._decision_log.append(CycleRecord(
+            ts=1700000000.0, active_bin=100, mid=150.0,
+            regime_half_life=0.0, regime_hurst=0.0, regime_trending=False,
+            decision="quote", urgency="normal", action="hold",
+            inventory_base=5.0, inventory_quote=750.0,
+            r_reservation=150.0, half_spread=0.1,
+            ladder_center=100, ladder_levels=5,
+            refresh_needed=False, refresh_reason="",
+            net_delta=5.0, sigma=0.30,
+        ))
+
+        dlmm_self = type("Fake", (), {
+            "keeper": mock_keeper,
+            "_shared_book": shared_book,
+            "update_processed_data": DLMMController.update_processed_data,
+        })()
+
+        await DLMMController.update_processed_data(dlmm_self)
+        shared_book.dlmm_sigma = 0.30
+
+        hedge_self = self._make_hedge_self(shared_book, perp_position=-3.0)
+        hedge_self._hedge.evaluate = MagicMock(return_value=("rehedge", 5.0, None))
+        await HedgeController.update_processed_data(hedge_self)
+
+        actions = HedgeController.determine_executor_actions(hedge_self)
+        assert len(actions) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_shared_book_hedge_is_noop(self, mock_keeper):
+        """HedgeController without a shared_book is a no-op in both
+        update_processed_data and determine_executor_actions."""
+        from opms.controllers.generic.hedge_controller import HedgeController
+
+        hedge_self = self._make_hedge_self(None)
+
+        await HedgeController.update_processed_data(hedge_self)
+        actions = HedgeController.determine_executor_actions(hedge_self)
+        assert len(actions) == 0
