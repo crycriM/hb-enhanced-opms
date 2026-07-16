@@ -17,7 +17,7 @@ script derives ref_price from one live pool-info read instead of guessing.
 
 Usage:
   POOL=CgqwPLSFfht89pF5RSKGUUMFj5zRxoUt4861w2SkXaqY \
-  PYTHONPATH=opms/src .venv-legacy/bin/python -m opms.research.keeper_dryrun
+  PYTHONPATH=hb-enhanced-opms/src .venv-legacy/bin/python -m opms.research.keeper_dryrun
 
 Optional env: GATEWAY_URL, NETWORK, CYCLES, INTERVAL, CAPITAL, LEVELS.
 """

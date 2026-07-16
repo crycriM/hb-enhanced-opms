@@ -10,7 +10,7 @@ sends real transactions on mainnet.
 
 Usage (dry):
   POOL=Cgqw... POSITION=4mF3... WALLET=1odAb... \
-  PYTHONPATH=opms/src .venv-legacy/bin/python -m opms.research.roundtrip_dlmm
+  PYTHONPATH=hb-enhanced-opms/src .venv-legacy/bin/python -m opms.research.roundtrip_dlmm
 
 Add CONFIRM=yes to actually sign. Shape env: LOWER, UPPER, BASE_AMT, STRATEGY
 (0=Spot flat, 1=Curve, 2=BidAsk), SLIPPAGE_PCT.

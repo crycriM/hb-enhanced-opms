@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Path: ensure NEW opms/src takes precedence over dex_executor editable install
+# Path: ensure NEW hb-enhanced-opms/src takes precedence over dex_executor editable install
 # ---------------------------------------------------------------------------
 
 _src = str(Path(__file__).parent.parent / "src")

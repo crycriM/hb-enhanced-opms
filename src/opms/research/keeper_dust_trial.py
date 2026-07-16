@@ -18,7 +18,7 @@ given POSITION.
 
 Usage (dry preview, default):
   POOL=Cgqw... WALLET=1odAb... \
-  PYTHONPATH=opms/src .venv-legacy/bin/python -m opms.research.keeper_dust_trial
+  PYTHONPATH=hb-enhanced-opms/src .venv-legacy/bin/python -m opms.research.keeper_dust_trial
 
 Then, to actually sign:
   ... CONFIRM=yes ... (same command)

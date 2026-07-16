@@ -97,7 +97,7 @@ Tests do not require a live Hummingbot runtime. The `conftest.py` injects stub m
 ## Dependency layout
 
 ```
-opms/
+hb-enhanced-opms/
 ├── pyproject.toml
 ├── src/opms/
 │   ├── analytics/
