@@ -19,9 +19,9 @@ def _transport(handlers: dict[str, dict]) -> httpx.MockTransport:
 
 def test_get_state_success():
     t = _transport({
-        "/meteora/pool-info": {
+        "/connectors/meteora/clmm/pool-info": {
             "status": 200,
-            "body": {"activeBin": 42, "tvl": 10000.0},
+            "body": {"activeBinId": 42, "price": 2.0, "baseTokenAmount": 100.0, "quoteTokenAmount": 5000.0},
         },
     })
     cfg = GatewayConfig(wallet="w1")
@@ -30,19 +30,19 @@ def test_get_state_success():
     r = bridge.get_state("pool1")
     assert r.ok
     assert r.data["active_bin"] == 42
-    assert r.data["tvl_usd"] == 10000.0
+    assert r.data["tvl_usd"] == 5200.0
     bridge._client.close()
 
 
 def test_get_state_with_position():
     t = _transport({
-        "/meteora/pool-info": {
+        "/connectors/meteora/clmm/pool-info": {
             "status": 200,
-            "body": {"activeBin": 10, "tvl": 5000.0},
+            "body": {"activeBinId": 10, "price": 100.0, "baseTokenAmount": 0.0, "quoteTokenAmount": 0.0},
         },
-        "/meteora/position-info": {
+        "/connectors/meteora/clmm/position-info": {
             "status": 200,
-            "body": {"baseAmount": 1.5, "quoteAmount": 200.0},
+            "body": {"baseTokenAmount": 1.5, "quoteTokenAmount": 200.0},
         },
     })
     cfg = GatewayConfig(wallet="w1")
@@ -58,7 +58,7 @@ def test_get_state_with_position():
 
 def test_get_state_pool_error():
     t = _transport({
-        "/meteora/pool-info": {"status": 500, "body": {"error": "fail"}},
+        "/connectors/meteora/clmm/pool-info": {"status": 500, "body": {"error": "fail"}},
     })
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
@@ -70,7 +70,7 @@ def test_get_state_pool_error():
 
 def test_deposit_first():
     t = _transport({
-        "/meteora/open-position": {
+        "/connectors/meteora/clmm/open-position": {
             "status": 200,
             "body": {"positionAddress": "pos_new", "signature": "sig1"},
         },
@@ -87,7 +87,7 @@ def test_deposit_first():
 
 def test_deposit_second():
     t = _transport({
-        "/meteora/add-liquidity": {
+        "/connectors/meteora/clmm/add-liquidity": {
             "status": 200,
             "body": {"signature": "sig2"},
         },
@@ -103,7 +103,7 @@ def test_deposit_second():
 
 def test_withdraw_full():
     t = _transport({
-        "/meteora/close-position": {"status": 200, "body": {"signature": "sig_w"}},
+        "/connectors/meteora/clmm/close-position": {"status": 200, "body": {"signature": "sig_w"}},
     })
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
@@ -117,7 +117,7 @@ def test_withdraw_full():
 
 def test_withdraw_partial():
     t = _transport({
-        "/meteora/remove-liquidity": {"status": 200, "body": {"signature": "sig_r"}},
+        "/connectors/meteora/clmm/remove-liquidity": {"status": 200, "body": {"signature": "sig_r"}},
     })
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
@@ -131,7 +131,7 @@ def test_withdraw_partial():
 
 def test_swap():
     t = _transport({
-        "/jupiter/execute-swap": {"status": 200, "body": {"signature": "sig_s"}},
+        "/connectors/meteora/clmm/execute-swap": {"status": 200, "body": {"signature": "sig_s"}},
     })
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
@@ -147,9 +147,9 @@ def test_refresh_bundle_success():
     def handler(request):
         path = request.url.path
         call_log.append(path)
-        if path == "/meteora/close-position":
+        if path == "/connectors/meteora/clmm/close-position":
             return httpx.Response(200, json={"signature": "sig_w"})
-        if path in ("/meteora/open-position", "/meteora/add-liquidity"):
+        if path in ("/connectors/meteora/clmm/open-position", "/connectors/meteora/clmm/add-liquidity"):
             call_count["deposit"] += 1
             return httpx.Response(200, json={"positionAddress": f"pos_{call_count['deposit']}", "signature": f"sig_d{call_count['deposit']}"})
         return httpx.Response(500, json={})
@@ -163,7 +163,7 @@ def test_refresh_bundle_success():
         {"pool": "pool1", "bid_bins": [1], "bid_amounts": [10.0], "ask_bins": [3], "ask_amounts": [20.0]},
     )
     assert r.ok
-    assert "/meteora/close-position" in call_log
+    assert "/connectors/meteora/clmm/close-position" in call_log
     bridge._client.close()
 
 
@@ -172,11 +172,11 @@ def test_refresh_bundle_swap_fail_continues():
     def handler(request):
         path = request.url.path
         call_log.append(path)
-        if path == "/meteora/close-position":
+        if path == "/connectors/meteora/clmm/close-position":
             return httpx.Response(200, json={"signature": "sig_w"})
-        if path == "/jupiter/execute-swap":
+        if path == "/connectors/meteora/clmm/execute-swap":
             return httpx.Response(200, json={"error": "swap fail"})
-        if path == "/meteora/open-position":
+        if path == "/connectors/meteora/clmm/open-position":
             return httpx.Response(200, json={"positionAddress": "pos_new", "signature": "sig_d"})
         return httpx.Response(500, json={})
     t = httpx.MockTransport(handler)
@@ -189,13 +189,13 @@ def test_refresh_bundle_swap_fail_continues():
         {"pool": "pool1", "bid_bins": [1], "bid_amounts": [10.0], "ask_bins": [], "ask_amounts": []},
     )
     assert r.ok
-    assert "/jupiter/execute-swap" in call_log
+    assert "/connectors/meteora/clmm/execute-swap" in call_log
     bridge._client.close()
 
 
 def test_refresh_bundle_withdraw_fail():
     t = _transport({
-        "/meteora/close-position": {"status": 500, "body": {"error": "fail"}},
+        "/connectors/meteora/clmm/close-position": {"status": 500, "body": {"error": "fail"}},
     })
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
@@ -207,7 +207,7 @@ def test_refresh_bundle_withdraw_fail():
 
 def test_http_error():
     t = _transport({
-        "/meteora/pool-info": {"status": 500, "body": {"error": "server err"}},
+        "/connectors/meteora/clmm/pool-info": {"status": 500, "body": {"error": "server err"}},
     })
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)

@@ -49,10 +49,16 @@ class GatewayExecBridge:
             self._client.close()
             self._client = None
 
-    def _post(self, path: str, body: dict) -> ExecResult:
+    # Gateway 2.x namespaces every Meteora route under this prefix.
+    _CLMM = "/connectors/meteora/clmm"
+
+    def _request(self, method: str, path: str, payload: dict) -> ExecResult:
         assert self._client is not None, "call start() before using the bridge"
         try:
-            resp = self._client.post(path, json={**self._base_fields(), **body})
+            if method == "GET":
+                resp = self._client.get(path, params=payload)
+            else:
+                resp = self._client.post(path, json=payload)
             resp.raise_for_status()
             raw = resp.json()
         except httpx.HTTPStatusError as e:
@@ -68,13 +74,14 @@ class GatewayExecBridge:
             tx_signatures=self._extract_sigs(raw),
         )
 
-    def _base_fields(self) -> dict:
-        return {
-            "connector": self.cfg.connector,
-            "chain": self.cfg.chain,
-            "network": self.cfg.network,
-            "wallet": self.cfg.wallet,
-        }
+    def _get(self, path: str, params: dict) -> ExecResult:
+        return self._request("GET", path, {"network": self.cfg.network, **params})
+
+    def _post(self, path: str, body: dict) -> ExecResult:
+        # ponytail: write verbs (open/add/remove/close/swap) not yet verified
+        # against live Gateway 2.15.0 schemas — D5.2 gate must confirm bodies
+        # (open-position uses lowerPrice/upperPrice, not binIds/amounts arrays).
+        return self._request("POST", path, {"network": self.cfg.network, "walletAddress": self.cfg.wallet, **body})
 
     @staticmethod
     def _extract_sigs(raw: dict) -> list[str]:
@@ -85,23 +92,30 @@ class GatewayExecBridge:
         return []
 
     def get_state(self, pool: str) -> ExecResult:
-        pool_r = self._post("/meteora/pool-info", {"poolAddress": pool})
+        pool_r = self._get(f"{self._CLMM}/pool-info", {"poolAddress": pool})
         if not pool_r.ok:
             return pool_r
+        d = pool_r.data
 
+        # Quote is USDC in the SOL/USDC pool; TVL in quote terms. pool-info
+        # exposes no tvl field, so derive it from reserves × price.
+        price = float(d.get("price", 0) or 0)
+        base_amt = float(d.get("baseTokenAmount", 0) or 0)
+        quote_amt = float(d.get("quoteTokenAmount", 0) or 0)
         state: dict = {
-            "active_bin": pool_r.data.get("activeBin", pool_r.data.get("active_bin", 0)),
-            "tvl_usd": pool_r.data.get("tvl", pool_r.data.get("tvlUsd")),
+            "active_bin": d.get("activeBinId", d.get("activeBin", 0)),
+            "price": price,
+            "tvl_usd": base_amt * price + quote_amt,
             "balances": {"base": 0.0, "quote": 0.0},
         }
 
         pos_id = self._positions.get(pool)
         if pos_id:
-            pos_r = self._post("/meteora/position-info", {"positionAddress": pos_id, "poolAddress": pool})
+            pos_r = self._get(f"{self._CLMM}/position-info", {"positionAddress": pos_id})
             if pos_r.ok and pos_r.data:
                 state["balances"] = {
-                    "base": float(pos_r.data.get("baseAmount", pos_r.data.get("balanceX", 0))),
-                    "quote": float(pos_r.data.get("quoteAmount", pos_r.data.get("balanceY", 0))),
+                    "base": float(pos_r.data.get("baseTokenAmount", pos_r.data.get("baseAmount", 0)) or 0),
+                    "quote": float(pos_r.data.get("quoteTokenAmount", pos_r.data.get("quoteAmount", 0)) or 0),
                 }
 
         return ExecResult(ok=True, data=state)
@@ -124,7 +138,7 @@ class GatewayExecBridge:
                 "side": side,
                 "strategy": strategy_type,
             }
-            result = self._post("/meteora/add-liquidity", body)
+            result = self._post(f"{self._CLMM}/add-liquidity", body)
         else:
             body = {
                 "poolAddress": pool,
@@ -133,7 +147,7 @@ class GatewayExecBridge:
                 "side": side,
                 "strategy": strategy_type,
             }
-            result = self._post("/meteora/open-position", body)
+            result = self._post(f"{self._CLMM}/open-position", body)
 
         if result.ok and result.data:
             pos_addr = result.data.get("positionAddress", result.data.get("position_id"))
@@ -144,7 +158,7 @@ class GatewayExecBridge:
         return result
 
     def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
-        endpoint = "/meteora/close-position" if bps >= 100 else "/meteora/remove-liquidity"
+        endpoint = f"{self._CLMM}/close-position" if bps >= 100 else f"{self._CLMM}/remove-liquidity"
         result = self._post(endpoint, {"positionAddress": position_id, "liquidityToRemoveBps": bps})
         if result.ok and bps >= 100:
             self._positions = {k: v for k, v in self._positions.items() if v != position_id}
@@ -158,7 +172,7 @@ class GatewayExecBridge:
         max_slippage_bps: int = 50,
         pool: Optional[str] = None,
     ) -> ExecResult:
-        return self._post("/jupiter/execute-swap", {
+        return self._post(f"{self._CLMM}/execute-swap", {
             "tokenAddress": in_mint,
             "tokenAddress2": out_mint,
             "amount": amount,
