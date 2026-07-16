@@ -1,16 +1,26 @@
 """Tests for GatewayExecBridge against httpx.MockTransport."""
 
+import json
+
 import httpx
 import pytest
 from opms.gateway.exec_bridge import GatewayConfig, GatewayExecBridge
 
+_ANCHOR = {"activeBinId": 0, "price": 100.0, "binStep": 80}  # step = 1.008
 
-def _transport(handlers: dict[str, dict]) -> httpx.MockTransport:
-    """MockTransport that routes by (method, url) to handlers."""
+
+def _transport(handlers: dict[str, dict], recorder: list | None = None) -> httpx.MockTransport:
+    """MockTransport that routes by (method, url) to handlers, defaulting
+    unmocked pool-info reads to _ANCHOR so deposit tests don't need to
+    repeat it. Records (path, json_body) for POSTs when `recorder` is given."""
     def handler(request):
         key = request.url.path
+        if recorder is not None and request.method == "POST":
+            recorder.append((key, json.loads(request.content)))
         h = handlers.get(key)
         if h is None:
+            if key == "/connectors/meteora/clmm/pool-info":
+                return httpx.Response(200, json=_ANCHOR)
             return httpx.Response(500, json={"error": "not found"})
         code = h.get("status", 200)
         return httpx.Response(code, json=h["body"])
@@ -68,13 +78,14 @@ def test_get_state_pool_error():
     bridge._client.close()
 
 
-def test_deposit_first():
+def test_deposit_first_converts_bins_to_price_range():
+    recorder = []
     t = _transport({
         "/connectors/meteora/clmm/open-position": {
             "status": 200,
             "body": {"positionAddress": "pos_new", "signature": "sig1"},
         },
-    })
+    }, recorder=recorder)
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
     bridge._client = httpx.Client(transport=t, base_url="http://mock")
@@ -82,22 +93,37 @@ def test_deposit_first():
     assert r.ok
     assert bridge._positions.get("pool1") == "pos_new"
     assert r.data["position_id"] == "pos_new"
+
+    body = next(b for p, b in recorder if p == "/connectors/meteora/clmm/open-position")
+    step = 1.008
+    assert body["lowerPrice"] == pytest.approx(100.0 * step ** 1)
+    assert body["upperPrice"] == pytest.approx(100.0 * step ** 2)
+    assert body["quoteTokenAmount"] == 30.0   # bid side: quote only
+    assert body["baseTokenAmount"] == 0
+    assert body["strategyType"] == 0          # Spot
+    assert "binIds" not in body and "amounts" not in body
     bridge._client.close()
 
 
-def test_deposit_second():
+def test_deposit_second_routes_to_add_liquidity():
+    recorder = []
     t = _transport({
         "/connectors/meteora/clmm/add-liquidity": {
             "status": 200,
             "body": {"signature": "sig2"},
         },
-    })
+    }, recorder=recorder)
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
     bridge._client = httpx.Client(transport=t, base_url="http://mock")
     bridge._positions["pool1"] = "pos1"
     r = bridge.deposit_single_sided("pool1", "ask", [3], [15.0])
     assert r.ok
+
+    body = next(b for p, b in recorder if p == "/connectors/meteora/clmm/add-liquidity")
+    assert body["positionAddress"] == "pos1"
+    assert body["baseTokenAmount"] == 15.0    # ask side: base only
+    assert body["quoteTokenAmount"] == 0
     bridge._client.close()
 
 
@@ -112,6 +138,20 @@ def test_withdraw_full():
     r = bridge.withdraw("pos1", bps=100)
     assert r.ok
     assert "pos1" not in bridge._positions["pool1"] if "pool1" in bridge._positions else True
+    bridge._client.close()
+
+
+def test_withdraw_full_body_has_no_bps():
+    recorder = []
+    t = _transport({
+        "/connectors/meteora/clmm/close-position": {"status": 200, "body": {"signature": "sig_w"}},
+    }, recorder=recorder)
+    cfg = GatewayConfig(wallet="w1")
+    bridge = GatewayExecBridge(cfg)
+    bridge._client = httpx.Client(transport=t, base_url="http://mock")
+    bridge.withdraw("pos1", bps=100)
+    body = next(b for p, b in recorder if p == "/connectors/meteora/clmm/close-position")
+    assert body == {"network": "mainnet-beta", "walletAddress": "w1", "positionAddress": "pos1"}
     bridge._client.close()
 
 
@@ -147,6 +187,8 @@ def test_refresh_bundle_success():
     def handler(request):
         path = request.url.path
         call_log.append(path)
+        if path == "/connectors/meteora/clmm/pool-info":
+            return httpx.Response(200, json=_ANCHOR)
         if path == "/connectors/meteora/clmm/close-position":
             return httpx.Response(200, json={"signature": "sig_w"})
         if path in ("/connectors/meteora/clmm/open-position", "/connectors/meteora/clmm/add-liquidity"):
@@ -172,6 +214,8 @@ def test_refresh_bundle_swap_fail_continues():
     def handler(request):
         path = request.url.path
         call_log.append(path)
+        if path == "/connectors/meteora/clmm/pool-info":
+            return httpx.Response(200, json=_ANCHOR)
         if path == "/connectors/meteora/clmm/close-position":
             return httpx.Response(200, json={"signature": "sig_w"})
         if path == "/connectors/meteora/clmm/execute-swap":

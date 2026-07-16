@@ -78,10 +78,22 @@ class GatewayExecBridge:
         return self._request("GET", path, {"network": self.cfg.network, **params})
 
     def _post(self, path: str, body: dict) -> ExecResult:
-        # ponytail: write verbs (open/add/remove/close/swap) not yet verified
-        # against live Gateway 2.15.0 schemas — D5.2 gate must confirm bodies
-        # (open-position uses lowerPrice/upperPrice, not binIds/amounts arrays).
         return self._request("POST", path, {"network": self.cfg.network, "walletAddress": self.cfg.wallet, **body})
+
+    _STRATEGY_INT = {"Spot": 0, "Curve": 1, "BidAsk": 2}
+
+    def _bin_price_fn(self, pool: str) -> ExecResult:
+        """One pool-info read anchoring (price, activeBinId, binStep) so bin
+        ids can be converted to prices — Meteora bin ids aren't a fixed
+        ref=1.0 grid, see keeper_dryrun.py. Returns a bin_id -> price callable
+        in `.data["fn"]` on success."""
+        anchor = self._get(f"{self._CLMM}/pool-info", {"poolAddress": pool})
+        if not anchor.ok:
+            return anchor
+        d = anchor.data
+        price, active_bin, bin_step_bps = float(d["price"]), int(d["activeBinId"]), int(d["binStep"])
+        step = 1.0 + bin_step_bps / 1e4
+        return ExecResult(ok=True, data={"fn": lambda bin_id: price * step ** (bin_id - active_bin)})
 
     @staticmethod
     def _extract_sigs(raw: dict) -> list[str]:
@@ -128,25 +140,38 @@ class GatewayExecBridge:
         amounts: list[float],
         strategy_type: str = "Spot",
     ) -> ExecResult:
+        """Collapses the keeper's per-bin ladder levels for one side into a
+        single canned-strategy sub-position spanning [min(bin_ids),
+        max(bin_ids)] — the PWL-tiling insight (STATUS.md §4): Gateway has no
+        per-bin control, but one flat Spot tile per side is a valid (if
+        coarse) first cut. Multi-segment AS-skew tiling is future work."""
+        anchor = self._bin_price_fn(pool)
+        if not anchor.ok:
+            return anchor
+        price_of = anchor.data["fn"]
+        lower_price, upper_price = price_of(min(bin_ids)), price_of(max(bin_ids))
+        total = sum(amounts)
+
+        # ponytail: add-liquidity body shape unverified live (only
+        # open-position/close-position proven, D5.2/D5.3) — also, tracking
+        # `_positions` by pool alone (not pool+side) means a second
+        # single-sided deposit on the other side overwrites this one's
+        # position_id. Fine for a single-leg call; fix before depositing both
+        # sides of a ladder in the same cycle.
         existing_pos = self._positions.get(pool)
+        body = {
+            "poolAddress": pool,
+            "lowerPrice": lower_price,
+            "upperPrice": upper_price,
+            "baseTokenAmount": total if side == "ask" else 0,
+            "quoteTokenAmount": total if side == "bid" else 0,
+            "strategyType": self._STRATEGY_INT.get(strategy_type, 0),
+            "slippagePct": 1.0,
+        }
         if existing_pos:
-            body = {
-                "poolAddress": pool,
-                "positionAddress": existing_pos,
-                "binIds": bin_ids,
-                "amounts": amounts,
-                "side": side,
-                "strategy": strategy_type,
-            }
+            body["positionAddress"] = existing_pos
             result = self._post(f"{self._CLMM}/add-liquidity", body)
         else:
-            body = {
-                "poolAddress": pool,
-                "binIds": bin_ids,
-                "amounts": amounts,
-                "side": side,
-                "strategy": strategy_type,
-            }
             result = self._post(f"{self._CLMM}/open-position", body)
 
         if result.ok and result.data:
@@ -158,10 +183,15 @@ class GatewayExecBridge:
         return result
 
     def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
-        endpoint = f"{self._CLMM}/close-position" if bps >= 100 else f"{self._CLMM}/remove-liquidity"
-        result = self._post(endpoint, {"positionAddress": position_id, "liquidityToRemoveBps": bps})
-        if result.ok and bps >= 100:
+        if bps >= 100:
+            # Verified shape (D5.2/D5.3): close-position takes only
+            # positionAddress, no liquidityToRemoveBps.
+            result = self._post(f"{self._CLMM}/close-position", {"positionAddress": position_id})
             self._positions = {k: v for k, v in self._positions.items() if v != position_id}
+        else:
+            # ponytail: remove-liquidity body shape unverified live.
+            result = self._post(f"{self._CLMM}/remove-liquidity",
+                                 {"positionAddress": position_id, "liquidityToRemoveBps": bps})
         return result
 
     def swap(
