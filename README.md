@@ -65,17 +65,82 @@ OPMS is the execution layer of the [amm-solution](https://github.com/amm-solutio
 
 ## Installation
 
-OPMS depends on `mm_core` and `perp_bot` (both local packages in the amm-solution monorepo).
+OPMS depends on `mm_core`, `perp_bot`, and `dlmm_bot` (all local packages in
+the amm-solution monorepo). **Hummingbot itself is NOT pip-installable from
+PyPI** — its isolated sdist build fails on Cython `.pyx` globbing — so it
+lives in its own conda env and the Python packages are installed *into* that
+env.
 
-**hummingbot is NOT pip-installable from PyPI.** Install via conda first:
+### Hummingbot dependency deployment
+
+Hummingbot is the "body" that actually places orders. Create its conda env
+(named `hummingbot-venv`) from the Hummingbot checkout's `setup/environment.yml`,
+then install the monorepo deps + OPMS into that same env:
 
 ```bash
+# 1. Create the conda env from the Hummingbot checkout's environment.yml
 conda env create -f <hummingbot-checkout>/setup/environment.yml
 conda activate hummingbot-venv
-pip install -e .
+
+# 2. Install the monorepo dependencies + OPMS into that env
+pip install -e ../mm-core
+pip install -e ../perp-bot
+pip install -e .          # this package (opms)
 ```
 
-Or install all three (mm_core, perp_bot, opms) inside the Hummingbot conda env.
+Notes:
+
+- One venv per project (see the monorepo `AGENTS.md`). This is the deliberate
+  exception — Hummingbot is conda-only.
+- `<hummingbot-checkout>` is a local Hummingbot clone pinned to the version
+  that carries the multi-subaccount `vaultAddress` fixes (connector issues
+  [#6805](https://github.com/hummingbot/hummingbot/issues/6805) /
+  [#7324](https://github.com/hummingbot/hummingbot/issues/7324)) — see
+  `perp-bot/docs/account-naming.md` before trusting subaccount routing with
+  real capital.
+- Tests do **not** require a live Hummingbot runtime or a running connector:
+  `conftest.py` stubs all HB types via `sys.modules` injection.
+
+### Hyperliquid credentials & subaccounts
+
+Credentials live in the repo-root `.env` (values are secrets — never commit
+this file; add `.env` to `.gitignore`). Each subaccount has its own key
+triple, in the `{EXCHANGE}_{ACCOUNT_ID}_{CREDENTIAL_TYPE}` shape:
+
+| Subaccount | Keeper `account_id` | `.env` keys | Collateral |
+|---|---|---|---|
+| `HYPERLIQUID_E2_MM1` | `basket_a` (Sub A) | `HYPERLIQUID_E2_MM1_PRIVATE_KEY`, `HYPERLIQUID_E2_MM1_ACCOUNT_ADDRESS`, `HYPERLIQUID_E2_MM1_IS_TESTNET` | 300 USDC |
+| `HYPERLIQUID_E2_MM2` | `basket_b` (Sub B) | `HYPERLIQUID_E2_MM2_PRIVATE_KEY`, `HYPERLIQUID_E2_MM2_ACCOUNT_ADDRESS`, `HYPERLIQUID_E2_MM2_IS_TESTNET` | 300 USDC |
+
+`HYPERLIQUID_E2_MAIN_*` holds the master-agent key set (used at
+`createSubAccount` time). See `perp-bot/docs/account-naming.md` for the full
+subaccount-auth mechanics and the rule to use an **agent-wallet** key for
+`_PRIVATE_KEY` (no withdraw rights), never the master's own key.
+
+**How the credentials are used** — two paths exist and are not interchangeable:
+
+- **Live path (`hb-enhanced-opms` + Hummingbot connector):** the wallet
+  credentials are imported once into Hummingbot's encrypted
+  `conf/connectors/` store — via `scripts/import_hl_testnet_credentials.py`
+  or HB's interactive `connect` command — and are **not** read from `.env` at
+  runtime. The running controller's `PerpMMControllerConfig.connector_name`
+  selects the wallet; `venue`/`account_id` are routing labels only.
+- **`dex_executor`'s `AccountRegistry`:** reads `{EXCHANGE}_{ACCOUNT_ID}_...`
+  vars from the environment live. This path is currently bypassed for live HL
+  trading.
+
+The `.env` keys above are the canonical shape both paths (and the import
+script's one-off env vars) follow.
+
+**⚠ `account_id` must stay consistent across the stack.** `basket_config.py`
+labels the two keepers `account_id="basket_a"` / `"basket_b"`; those labels
+thread into `validate_account_topology`, decision logs, and the OPMS fills
+websocket (`/ws/fills/hyperliquid?account_id=...`). Map `basket_a` →
+`HYPERLIQUID_E2_MM1` and `basket_b` → `HYPERLIQUID_E2_MM2` and keep that slug
+identical between `PerpPairConfig` and the corresponding `PerpMMControllerConfig`
+(so the connector's `vaultAddress` points at the matching subaccount). Getting
+it wrong silently misroutes fills/logs even though the trade still hits the
+right wallet.
 
 ## Testing
 
