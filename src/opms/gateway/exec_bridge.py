@@ -31,6 +31,8 @@ class GatewayConfig:
     chain: str = "solana"
     network: str = "mainnet-beta"
     timeout: float = 30.0
+    base_decimals: int = 9
+    quote_decimals: int = 6
 
 
 class GatewayExecBridge:
@@ -68,11 +70,11 @@ class GatewayExecBridge:
 
         if "error" in raw and raw["error"]:
             return ExecResult(ok=False, error=str(raw["error"]))
-        return ExecResult(
-            ok=True,
-            data=raw,
-            tx_signatures=self._extract_sigs(raw),
-        )
+        data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+        envelope = dict(raw)
+        envelope["ok"] = True
+        envelope["data"] = dict(data)
+        return ExecResult.from_payload(envelope)
 
     def _get(self, path: str, params: dict) -> ExecResult:
         return self._request("GET", path, {"network": self.cfg.network, **params})
@@ -103,6 +105,66 @@ class GatewayExecBridge:
                 return [val] if isinstance(val, str) else list(val)
         return []
 
+    @staticmethod
+    def _first(data: dict, *keys, default=None):
+        for key in keys:
+            if data.get(key) is not None:
+                return data[key]
+        return default
+
+    def get_position(self, position_id: str) -> ExecResult:
+        result = self._get(
+            f"{self._CLMM}/position-info", {"positionAddress": position_id}
+        )
+        if not result.ok or not isinstance(result.data, dict):
+            return result
+        raw = result.data
+        fee_x_raw = self._first(
+            raw, "claimable_fee_x_raw", "claimableFeeXRaw", "feeXRaw"
+        )
+        fee_y_raw = self._first(
+            raw, "claimable_fee_y_raw", "claimableFeeYRaw", "feeYRaw"
+        )
+        fee_x = self._first(raw, "claimable_fee_x", "claimableFeeX")
+        fee_y = self._first(raw, "claimable_fee_y", "claimableFeeY")
+        if fee_x is None and fee_x_raw is not None:
+            fee_x = float(fee_x_raw) / 10 ** self.cfg.base_decimals
+        if fee_y is None and fee_y_raw is not None:
+            fee_y = float(fee_y_raw) / 10 ** self.cfg.quote_decimals
+
+        bins = []
+        for source in raw.get("bins", raw.get("positions", [])) or []:
+            if not isinstance(source, dict):
+                continue
+            row = dict(source)
+            row["bin_id"] = self._first(source, "bin_id", "binId", "activeBin")
+            row["amount_x_raw"] = self._first(
+                source, "amount_x_raw", "amountXRaw"
+            )
+            row["amount_y_raw"] = self._first(
+                source, "amount_y_raw", "amountYRaw"
+            )
+            bins.append(row)
+
+        result.data = {
+            "raw": raw,
+            "position_id": position_id,
+            "active_bin": self._first(raw, "active_bin", "activeBinId", "activeBin"),
+            "bins": bins,
+            "claimable_fee_x_raw": fee_x_raw,
+            "claimable_fee_y_raw": fee_y_raw,
+            "claimable_fee_x": float(fee_x or 0.0),
+            "claimable_fee_y": float(fee_y or 0.0),
+            "base_amount": float(self._first(
+                raw, "baseTokenAmount", "baseAmount", default=0.0
+            ) or 0.0),
+            "quote_amount": float(self._first(
+                raw, "quoteTokenAmount", "quoteAmount", default=0.0
+            ) or 0.0),
+        }
+        result.position_id = position_id
+        return result
+
     def get_state(self, pool: str) -> ExecResult:
         pool_r = self._get(f"{self._CLMM}/pool-info", {"poolAddress": pool})
         if not pool_r.ok:
@@ -123,11 +185,11 @@ class GatewayExecBridge:
 
         pos_id = self._positions.get(pool)
         if pos_id:
-            pos_r = self._get(f"{self._CLMM}/position-info", {"positionAddress": pos_id})
+            pos_r = self.get_position(pos_id)
             if pos_r.ok and pos_r.data:
                 state["balances"] = {
-                    "base": float(pos_r.data.get("baseTokenAmount", pos_r.data.get("baseAmount", 0)) or 0),
-                    "quote": float(pos_r.data.get("quoteTokenAmount", pos_r.data.get("quoteAmount", 0)) or 0),
+                    "base": float(pos_r.data.get("base_amount", 0.0)),
+                    "quote": float(pos_r.data.get("quote_amount", 0.0)),
                 }
 
         return ExecResult(ok=True, data=state)
@@ -235,19 +297,39 @@ class GatewayExecBridge:
         bid_amounts = deposit_spec.get("bid_amounts", [])
         ask_amounts = deposit_spec.get("ask_amounts", [])
 
-        sigs = []
+        step_results = [withdraw_r]
+        if swap_spec and 'swap_r' in locals():
+            step_results.append(swap_r)
         if bid_bins:
             r = self.deposit_single_sided(pool, "bid", bid_bins, bid_amounts)
+            step_results.append(r)
             if not r.ok:
                 return ExecResult(ok=False, error=f"refresh_bundle: bid deposit failed: {r.error}")
-            sigs.extend(r.tx_signatures)
         if ask_bins:
             r = self.deposit_single_sided(pool, "ask", ask_bins, ask_amounts)
+            step_results.append(r)
             if not r.ok:
                 return ExecResult(ok=False, error=f"refresh_bundle: ask deposit failed: {r.error}")
-            sigs.extend(r.tx_signatures)
 
-        return ExecResult(ok=True, data={"steps": "withdraw+deposit"}, tx_signatures=sigs)
+        sigs = [sig for step in step_results for sig in step.tx_signatures]
+        receipts = [receipt for step in step_results for receipt in step.tx_receipts]
+        position_id = self._positions.get(pool)
+        return ExecResult(
+            ok=True,
+            data={
+                "steps": [step.data for step in step_results],
+                "position_id": position_id,
+            },
+            tx_signatures=sigs,
+            tx_receipts=receipts,
+            position_id=position_id,
+            slot=receipts[-1].get("slot") if receipts else None,
+            block_time=receipts[-1].get("block_time") if receipts else None,
+            fee_lamports=sum(
+                int(receipt["fee_lamports"])
+                for receipt in receipts if receipt.get("fee_lamports") is not None
+            ) if any(r.get("fee_lamports") is not None for r in receipts) else None,
+        )
 
 
 __all__ = ["GatewayConfig", "GatewayExecBridge"]

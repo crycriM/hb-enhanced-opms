@@ -76,11 +76,20 @@ async def _run() -> int:
         hedge_config=None,
         pool_address=pool,
         dry_run=True,
+        log_dir=os.environ.get("EVENT_LOG_DIR", "logs/dlmm"),
+        base_mint=os.environ.get("BASE_MINT", ""),
+        quote_mint=os.environ.get("QUOTE_MINT", ""),
+        executor_version="hummingbot-gateway",
     )
     bridge = GatewayExecBridge(GatewayConfig(gateway_url=gateway_url, network=network))
     keeper = Keeper(cfg=keeper_cfg, exec_bridge=bridge)
 
     bridge.start()
+    keeper._ensure_run_started()
+    keeper.emit(
+        "swap_stream_unavailable",
+        reason="keeper_dryrun has no decoded swap source",
+    )
     try:
         await keeper.run(max_cycles=cycles)
     finally:
@@ -93,6 +102,7 @@ async def _run() -> int:
               f"r={rec.r_reservation:8.4f} half_spread={rec.half_spread:.6f}")
 
     print(f"\n{len(log)}/{cycles} cycles produced a decision record (no uncaught _cycle() error).")
+    print(f"Audit event log: {keeper.event_log_path}")
     return 0 if len(log) == cycles else 1
 
 

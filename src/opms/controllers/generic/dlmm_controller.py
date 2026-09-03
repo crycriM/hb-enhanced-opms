@@ -11,6 +11,8 @@ by GatewayExecBridge).  This controller:
 
 import asyncio
 import logging
+import os
+import time
 from typing import List
 
 from pydantic import Field
@@ -18,10 +20,14 @@ from pydantic import Field
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.models.executor_actions import ExecutorAction
 
+from dlmm_bot.event_log import EventLog
 from dlmm_bot.exec_bridge import FakeExecBridge
 from dlmm_bot.grid import VenueGrid
-from dlmm_bot.keeper import Keeper, KeeperConfig
+from dlmm_bot.keeper import Keeper, KeeperConfig, hash_keeper_config
 from dlmm_bot.risk_dlmm import PairType
+from dlmm_bot.swap_observer import (
+    JsonlSwapEventSource, SwapObserver, SwapStreamRunner,
+)
 from opms.gateway.exec_bridge import GatewayConfig, GatewayExecBridge
 
 logger = logging.getLogger(__name__)
@@ -58,6 +64,11 @@ class DLMMControllerConfig(ControllerConfigBase):
     hedge_venue: str = "hyperliquid_perpetual"
     hedge_coin: str = ""
     decision_log_path: str | None = None
+    event_log_dir: str = "logs/dlmm"
+    swap_stream_path: str = ""
+    base_mint: str = ""
+    quote_mint: str = ""
+    gas_token_price_quote: float | None = None
     shared_book_key: str = ""
 
     @property
@@ -79,6 +90,8 @@ class DLMMController(ControllerBase):
             wallet=config.wallet,
             chain=config.chain,
             network=config.network,
+            base_decimals=config.base_decimals,
+            quote_decimals=config.quote_decimals,
         )
         self._bridge = GatewayExecBridge(gw_cfg)
 
@@ -107,8 +120,32 @@ class DLMMController(ControllerBase):
             refresh_interval=config.refresh_interval,
             pair_type=PairType(config.pair_type),
             dry_run=config.dry_run,
+            base_mint=config.base_mint,
+            quote_mint=config.quote_mint,
+            executor_version="hummingbot-gateway",
+            gas_token_price_quote=config.gas_token_price_quote,
         )
-        self.keeper = Keeper(cfg=keeper_cfg, exec_bridge=self._bridge)
+        run_id = (
+            f"run_{config.pool_address.replace('/', '_')}_{time.time_ns()}"
+        )
+        log_path = config.decision_log_path or os.path.join(
+            config.event_log_dir, f"{run_id}.jsonl"
+        )
+        self._event_log = EventLog(
+            log_path, run_id=run_id, config_hash=hash_keeper_config(keeper_cfg)
+        )
+        observer = SwapObserver(self._event_log, grid, config.pool_address)
+        self.keeper = Keeper(
+            cfg=keeper_cfg, exec_bridge=self._bridge,
+            event_log=self._event_log, swap_observer=observer,
+        )
+        source = (
+            JsonlSwapEventSource(config.swap_stream_path)
+            if config.swap_stream_path else None
+        )
+        self._swap_stream = (
+            SwapStreamRunner(observer, source) if source is not None else None
+        )
         self._cycle_task: asyncio.Task | None = None
 
         from .shared_risk_book import get_shared_book
@@ -116,14 +153,26 @@ class DLMMController(ControllerBase):
 
     async def on_start(self):
         self._bridge.start()
+        self.keeper._ensure_run_started()
+        if self._swap_stream is not None:
+            self._swap_stream.start()
+        else:
+            self.keeper.emit(
+                "swap_stream_unavailable",
+                reason="swap_stream_path is not configured",
+            )
 
     def on_stop(self):
+        if self._swap_stream is not None:
+            self._swap_stream.stop()
         self.keeper.stop()
+        self._event_log.close()
         self._bridge.stop()
 
     async def update_processed_data(self):
         try:
             await self.keeper._cycle()
+            self.keeper._cycle_count += 1
         except Exception as e:
             logger.exception("DLMMController: keeper cycle error: %s", e)
             return

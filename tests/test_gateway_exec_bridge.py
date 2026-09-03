@@ -259,3 +259,56 @@ def test_http_error():
     r = bridge.get_state("pool1")
     assert not r.ok
     bridge._client.close()
+
+
+def test_get_position_normalizes_raw_and_decimal_fees():
+    t = _transport({
+        "/connectors/meteora/clmm/position-info": {
+            "status": 200,
+            "body": {
+                "activeBinId": 42,
+                "bins": [{"binId": 41, "amountXRaw": 2_000_000}],
+                "claimableFeeXRaw": 1_500_000,
+                "claimableFeeYRaw": 2_500_000,
+            },
+        },
+    })
+    bridge = GatewayExecBridge(
+        GatewayConfig(wallet="w1", base_decimals=6, quote_decimals=6)
+    )
+    bridge._client = httpx.Client(transport=t, base_url="http://mock")
+    result = bridge.get_position("pos1")
+    assert result.ok
+    assert result.data["active_bin"] == 42
+    assert result.data["claimable_fee_x_raw"] == 1_500_000
+    assert result.data["claimable_fee_x"] == pytest.approx(1.5)
+    assert result.data["claimable_fee_y"] == pytest.approx(2.5)
+    assert result.data["bins"][0]["bin_id"] == 41
+    bridge._client.close()
+
+
+def test_response_normalizes_per_transaction_receipt_aliases():
+    t = _transport({
+        "/connectors/meteora/clmm/execute-swap": {
+            "status": 200,
+            "body": {
+                "signature": "sig_s",
+                "slot": 7,
+                "blockTime": 9,
+                "fee": 5000,
+                "computeUnitPrice": 2,
+            },
+        },
+    })
+    bridge = GatewayExecBridge(GatewayConfig(wallet="w1"))
+    bridge._client = httpx.Client(transport=t, base_url="http://mock")
+    result = bridge.swap("USDC", "SOL", 1.0)
+    assert result.tx_receipts == [{
+        "signature": "sig_s",
+        "slot": 7,
+        "block_time": 9,
+        "fee_lamports": 5000,
+        "compute_unit_price": 2,
+    }]
+    assert result.total_fee_lamports == 5000
+    bridge._client.close()

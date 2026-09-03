@@ -12,15 +12,17 @@ For offline testing without a live Gateway:
 
 import argparse
 import asyncio
-import json
 import logging
-from dataclasses import asdict
 from pathlib import Path
 
 from dlmm_bot.config import DLMMConfig
+from dlmm_bot.event_log import EventLog
 from dlmm_bot.exec_bridge import FakeExecBridge
 from dlmm_bot.grid import VenueGrid
-from dlmm_bot.keeper import Keeper, KeeperConfig
+from dlmm_bot.keeper import Keeper, KeeperConfig, hash_keeper_config
+from dlmm_bot.swap_observer import (
+    JsonlSwapEventSource, SwapObserver, SwapStreamRunner,
+)
 from dlmm_bot.risk_dlmm import PairType
 from opms.gateway.exec_bridge import GatewayConfig, GatewayExecBridge
 
@@ -51,7 +53,11 @@ def build_args():
     ap.add_argument("--cycles", type=int, default=20)
     ap.add_argument("--duration-s", type=float, default=0.0,
                     help="Max duration in seconds (0 = unlimited)")
-    ap.add_argument("--output", type=Path, default=Path("shadow-decisions.jsonl"))
+    ap.add_argument("--output", type=Path, default=Path("shadow-events.jsonl"))
+    ap.add_argument("--swap-stream-path", type=Path, default=None,
+                    help="decoded swap JSONL written by the Solana/TS observer")
+    ap.add_argument("--base-mint", default="")
+    ap.add_argument("--quote-mint", default="")
     ap.add_argument("--fake", action="store_true",
                     help="Use FakeExecBridge (offline testing, no Gateway needed)")
     return ap.parse_args()
@@ -94,9 +100,31 @@ async def main():
         refresh_interval=args.refresh_interval,
         pair_type=PairType(args.pair_type),
         dry_run=True,
+        base_mint=args.base_mint,
+        quote_mint=args.quote_mint,
+        executor_version=type(bridge).__name__,
     )
 
-    keeper = Keeper(cfg=keeper_cfg, exec_bridge=bridge)
+    event_log = EventLog(
+        str(args.output), config_hash=hash_keeper_config(keeper_cfg)
+    )
+    observer = SwapObserver(event_log, grid, args.pool)
+    keeper = Keeper(
+        cfg=keeper_cfg, exec_bridge=bridge,
+        event_log=event_log, swap_observer=observer,
+    )
+    swap_runner = (
+        SwapStreamRunner(observer, JsonlSwapEventSource(str(args.swap_stream_path)))
+        if args.swap_stream_path else None
+    )
+    if swap_runner is not None:
+        swap_runner.start()
+    else:
+        keeper._ensure_run_started()
+        keeper.emit(
+            "swap_stream_unavailable",
+            reason="--swap-stream-path is not configured",
+        )
     logger.info("Starting shadow run: %d cycles, dry_run=%s", args.cycles, True)
 
     try:
@@ -107,14 +135,16 @@ async def main():
     except asyncio.TimeoutError:
         logger.info("Shadow run reached duration limit; stopping keeper")
     finally:
+        if swap_runner is not None:
+            swap_runner.stop()
         keeper.stop()
+        event_log.close()
         bridge.stop()
 
-    with open(args.output, "w") as f:
-        for r in keeper.decision_log:
-            f.write(json.dumps(asdict(r)) + "\n")
-
-    logger.info("Wrote %d cycle records to %s", len(keeper.decision_log), args.output)
+    logger.info(
+        "Wrote %d keeper cycles to event log %s",
+        len(keeper.decision_log), args.output,
+    )
 
 
 if __name__ == "__main__":

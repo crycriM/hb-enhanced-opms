@@ -47,14 +47,34 @@ from opms.gateway.exec_bridge import GatewayConfig, GatewayExecBridge
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
-def _make_keeper(pool: str, gateway_url: str, network: str, wallet: str) -> Keeper:
+def _make_keeper(
+    pool: str,
+    gateway_url: str,
+    network: str,
+    wallet: str,
+    position_id: str | None = None,
+) -> Keeper:
     bridge = GatewayExecBridge(GatewayConfig(gateway_url=gateway_url, network=network, wallet=wallet))
     keeper_cfg = KeeperConfig(
         dlmm=DLMMConfig(), grid=VenueGrid(1000.0, 80, 9, 6),  # placeholder grid — only used by _cycle(), unused here
         pair_type=PairType.BLUECHIP, hedge_config=None,
-        pool_address=pool, dry_run=False,
+        pool_address=pool, dry_run=False, position_id=position_id,
+        log_dir=os.environ.get("EVENT_LOG_DIR", "logs/dlmm"),
+        base_mint=os.environ.get("BASE_MINT", ""),
+        quote_mint=os.environ.get("QUOTE_MINT", ""),
+        executor_version="hummingbot-gateway",
+        gas_token_price_quote=(
+            float(os.environ["GAS_TOKEN_PRICE_QUOTE"])
+            if os.environ.get("GAS_TOKEN_PRICE_QUOTE") else None
+        ),
     )
-    return Keeper(cfg=keeper_cfg, exec_bridge=bridge)
+    keeper = Keeper(cfg=keeper_cfg, exec_bridge=bridge)
+    keeper._ensure_run_started()
+    keeper.emit(
+        "swap_stream_unavailable",
+        reason="keeper_dust_trial has no decoded swap source",
+    )
+    return keeper
 
 
 async def _open(pool: str, gateway_url: str, network: str, wallet: str) -> int:
@@ -87,8 +107,10 @@ async def _open(pool: str, gateway_url: str, network: str, wallet: str) -> int:
     try:
         await keeper._deposit_ladder(ladder)
     finally:
+        keeper.stop()
         keeper.exec.stop()
 
+    print(f"Audit event log: {keeper.event_log_path}")
     if keeper._current_position_id:
         print(f"\nOpened position: {keeper._current_position_id}")
         print(f"Close it with: MODE=close POSITION={keeper._current_position_id} CONFIRM=yes ...")
@@ -97,22 +119,28 @@ async def _open(pool: str, gateway_url: str, network: str, wallet: str) -> int:
     return 1
 
 
-async def _close(gateway_url: str, network: str, wallet: str, position: str) -> int:
+async def _close(
+    pool: str, gateway_url: str, network: str, wallet: str, position: str
+) -> int:
     print(f"PLAN: close-position {position}")
     confirm = os.environ.get("CONFIRM") == "yes"
     if not confirm:
         print("\nDRY — nothing signed. Set CONFIRM=yes to execute.")
         return 0
 
-    print("\n>>> CONFIRM=yes — signing on mainnet via GatewayExecBridge.withdraw.")
-    bridge = GatewayExecBridge(GatewayConfig(gateway_url=gateway_url, network=network, wallet=wallet))
-    bridge.start()
+    print("\n>>> CONFIRM=yes — signing on mainnet via Keeper._stop_quoting.")
+    keeper = _make_keeper(
+        pool, gateway_url, network, wallet, position_id=position
+    )
+    keeper.exec.start()
     try:
-        result = bridge.withdraw(position, bps=100)
+        await keeper._stop_quoting()
     finally:
-        bridge.stop()
-    print(f"ok={result.ok} tx={result.tx_signatures} error={result.error}")
-    return 0 if result.ok else 1
+        keeper.stop()
+        keeper.exec.stop()
+    ok = keeper._current_position_id is None
+    print(f"ok={ok} audit_event_log={keeper.event_log_path}")
+    return 0 if ok else 1
 
 
 async def _run() -> int:
@@ -125,7 +153,9 @@ async def _run() -> int:
     if mode == "open":
         return await _open(pool, gateway_url, network, wallet)
     elif mode == "close":
-        return await _close(gateway_url, network, wallet, os.environ["POSITION"])
+        return await _close(
+            pool, gateway_url, network, wallet, os.environ["POSITION"]
+        )
     raise SystemExit(f"unknown MODE={mode!r}, expected open|close")
 
 
