@@ -2,7 +2,7 @@
 TwapRoundTripController — one-shot BUY-then-SELL TWAP round trip.
 
 Ad-hoc controller for the legacy-OPMS-PA-V2 vs HB-native-TWAP execution-
-profile comparison (see clmm-animation/docs/mm-remaining-tasks-BCDE.md,
+profile comparison (see clmm-animation/docs/common-mm-remaining-tasks-BCDE.md,
 Stream C parity note, 2026-07-10). Not part of the HB migration's
 permanent controller set — a throwaway harness to drive one TWAPExecutor
 buy of `total_amount_quote`, then one TWAPExecutor sell of the same size,

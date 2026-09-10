@@ -15,7 +15,7 @@ collects fill-level PnL / markout / slippage analytics. `hb` == **Hummingbot** e
 - There are **two** execution layers for the same OPMS role, kept in parity:
   - `dex_executor` — the **native** layer (direct exchange adapters).
   - `hb-enhanced-opms` — this repo, the **Hummingbot-based** duplicate (HB executors + controllers).
-- This is a "strangler-fig" migration (see `clmm-animation/docs/hummingbot-migration-plan.md`):
+- This is a "strangler-fig" migration (see `clmm-animation/docs/perp-hummingbot-migration-plan.md`):
   the native layer stays as the parity oracle; this HB layer supersedes a native module only after
   passing a **parity gate and a live gate** (decision-log diffing). Do not delete native modules early.
 

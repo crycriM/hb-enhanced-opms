@@ -204,7 +204,7 @@ class GatewayExecBridge:
     ) -> ExecResult:
         """Collapses the keeper's per-bin ladder levels for one side into a
         single canned-strategy sub-position spanning [min(bin_ids),
-        max(bin_ids)] — the PWL-tiling insight (STATUS.md §4): Gateway has no
+        max(bin_ids)] — the PWL-tiling insight (common-STATUS.md §4): Gateway has no
         per-bin control, but one flat Spot tile per side is a valid (if
         coarse) first cut. Multi-segment AS-skew tiling is future work."""
         anchor = self._bin_price_fn(pool)

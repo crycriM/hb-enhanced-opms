@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "opms"
 version = "0.1.0"
 description = "Hummingbot-based execution body: controllers, executors, and Gateway bridge wired to the mm_core brain"
-requires-python = ">=3.10.12,<3.13"
+requires-python = ">=3.10.12,<=3.13.15"
 dependencies = [
     "mm_core",
     "perp_bot",
@@ -27,3 +27,7 @@ where = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = [
+    "mainnet: requires Hyperliquid mainnet connection (OPMS_LIVE_MAINNET=confirm)",
+    "place_orders: places real orders on mainnet (requires OPMS_LIVE_PLACE_ORDERS=confirm)",
+]

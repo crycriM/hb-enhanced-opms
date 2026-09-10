@@ -51,6 +51,12 @@ OPMS is the execution layer of the [amm-solution](https://github.com/amm-solutio
 | `passive_aggressive_executor` | **Passive-Aggressive V2** execution: child limit orders at L1, refreshed on timer, falling back to aggressive (market) orders on cycle expiry. |
 | `_ac_math` | Pure Almgren-Chriss schedule math. No I/O, no asyncio, no service deps. HB-free and independently testable. |
 
+### `opms.gateway`
+
+| Module | Purpose |
+|--------|---------|
+| `exec_bridge` | `GatewayExecBridge` — HTTP client to the Hummingbot Gateway's DEX (Meteora/Jupiter) endpoints. HB-free (`httpx`), tested against a mock server. Only code that talks to the Gateway; needed for DEX venues, not for perp. |
+
 ### `opms.analytics`
 
 | Module | Purpose |
@@ -142,6 +148,26 @@ identical between `PerpPairConfig` and the corresponding `PerpMMControllerConfig
 it wrong silently misroutes fills/logs even though the trade still hits the
 right wallet.
 
+### Hummingbot Gateway (for DEX connectors — optional for perp)
+
+The **Hummingbot Gateway** is a separate HTTP service (default
+`http://localhost:15888`) that Hummingbot's **DEX** connectors attach to. It is
+**not** needed for the current Hyperliquid-perp path — that drives HB's
+`hyperliquid_perpetual` connector in-process via `InProcessClient`. The Gateway
+only comes into play for DEX venues (Meteora / DLMM), which is exactly the
+"future DEX support" case.
+
+- The Gateway **ships with Hummingbot** — there is nothing separate to
+  `pip install`. In the Docker deployment it runs alongside the HB container;
+  the `GatewayExecBridge` (the *only* code that talks to it) runs as an ordinary
+  host process and calls the Gateway over HTTP.
+- `opms/gateway/exec_bridge.py` is **HB-free** (plain `httpx`, no `hummingbot`
+  import) and fully testable against a mock HTTP server — `GatewayConfig`
+  defaults to `gateway_url="http://localhost:15888"`. Point it at your running
+  Gateway and configure a Meteora connector in the Gateway to go live.
+- For perp-only work, skip this — stand up the conda env and connectors above
+  and you're done.
+
 ## Testing
 
 ```bash
@@ -177,7 +203,7 @@ hb-enhanced-opms/
 │   │   └── passive_aggressive_executor.py
 │   ├── forecasting/
 │   │   └── historical_profile.py
-│   ├── gateway/             # (reserved)
+   │   ├── gateway/             # GatewayExecBridge — HTTP client to the Hummingbot Gateway (DEX only)
 │   ├── research/            # (reserved)
 │   └── risk/                # (reserved)
 └── tests/
