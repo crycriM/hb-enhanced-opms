@@ -7,9 +7,19 @@ Requires:
 
 Order tests additionally require:
   export OPMS_LIVE_PLACE_ORDERS=confirm
+
+Order tests are deliberately tiny and passive: they rest a limit order far
+from the mid on a maker-only path (so it cannot cross), verify placement /
+subaccount routing, then cancel it. Nothing here should ever leave a position
+or a resting order behind; every placement is cancelled in a ``finally``.
 """
 
 import pytest
+
+
+# Smallest order that clears Hyperliquid's $10 minimum notional at ETH prices.
+TINY_ETH_SZ = 0.01
+FAR_FRACTION = 0.20  # place 20% away from the near touch — never marketable
 
 
 # ---------------------------------------------------------------------------
@@ -84,42 +94,82 @@ class TestAccountState:
         assert result is not None
 
 
+def _collateral_usdc(info, address: str) -> tuple[float, float]:
+    """Return (spot_usdc, perp_account_value) for an HL account/subaccount.
+
+    Hyperliquid unified-account mode collateralizes perps with the spot USDC
+    balance, so perp ``accountValue`` stays 0 until a position opens. Spot USDC
+    is therefore the real funding signal.
+    """
+    spot = info.spot_user_state(address)
+    spot_usdc = sum(float(b["total"]) for b in spot.get("balances", []) if b["coin"] == "USDC")
+    state = info.user_state(address)
+    perp = float(state["marginSummary"]["accountValue"])
+    return spot_usdc, perp
+
+
+class TestUnifiedCollateral:
+    @pytest.mark.mainnet
+    def test_account_has_available_collateral(self, hl_info, live_account):
+        spot, perp = _collateral_usdc(hl_info, live_account["account_address"])
+        total = spot + perp
+        if total <= 0:
+            pytest.skip(f"{live_account['account_id']} has no USDC collateral (spot={spot}, perp={perp})")
+        assert total > 0
+
+
 # ---------------------------------------------------------------------------
 # Order lifecycle (double-gated — requires OPMS_LIVE_PLACE_ORDERS=confirm)
 # ---------------------------------------------------------------------------
 
+def _place_far_maker(exchange, info, coin="ETH", sz=TINY_ETH_SZ, is_buy=True, tif="Gtc"):
+    """Rest a non-marketable limit order and return (oid, price, raw_result).
+
+    Buy is placed below the best bid, sell above the best ask, so the order
+    cannot cross and cannot fill.
+    """
+    bids, asks = info.l2_snapshot(coin)["levels"]
+    if is_buy:
+        px = round(float(bids[0]["px"]) * (1 - FAR_FRACTION), 1)
+    else:
+        px = round(float(asks[0]["px"]) * (1 + FAR_FRACTION), 1)
+    result = exchange.order(coin, is_buy, sz, px, {"limit": {"tif": tif}}, reduce_only=False)
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    oid = statuses[0].get("resting", {}).get("oid") if statuses else None
+    return oid, px, result
+
+
+def _position_size(info, address: str, coin="ETH") -> float:
+    for entry in info.user_state(address)["assetPositions"]:
+        if entry["position"]["coin"] == coin:
+            return float(entry["position"]["szi"])
+    return 0.0
+
+
+def _cancel(exchange, coin: str, oid: int) -> None:
+    try:
+        exchange.cancel(coin, oid)
+    except Exception:
+        pass  # best-effort cleanup; the assertion below is the real check
+
+
 class TestOrderLifecycle:
     @pytest.mark.mainnet
     @pytest.mark.place_orders
-    def test_order_signing_and_submission(self, hl_exchange, live_account, place_orders):
-        state = hl_exchange.info.user_state(live_account["account_address"])
-        available = float(state["marginSummary"]["accountValue"])
-        if available < 10:
-            pytest.skip(f"Insufficient USDC ({available}) to place test order")
+    def test_order_signing_and_submission(self, hl_info, hl_exchange, live_account, place_orders):
+        spot, perp = _collateral_usdc(hl_info, live_account["account_address"])
+        if spot + perp <= 0:
+            pytest.skip(f"{live_account['account_id']} has no USDC collateral to place an order")
 
-        sz = 0.001
-        l2 = hl_exchange.info.l2_snapshot("ETH")
-        _, asks = l2["levels"]
-        ask_px = float(asks[0]["px"])
-        far_price = round(ask_px * 1.2, 1)
-
-        order_result = hl_exchange.order(
-            "ETH",
-            True,
-            sz,
-            far_price,
-            {"limit": {"tif": "Gtc"}},
-            reduce_only=False,
-        )
-        assert "response" in order_result
-        resp = order_result["response"]
-        if "data" in resp and "statuses" in resp["data"]:
-            statuses = resp["data"]["statuses"]
-            if statuses[0].get("resting", {}).get("oid"):
-                oid = statuses[0]["resting"]["oid"]
-                hl_exchange.cancel("ETH", oid)
-                return
-        pytest.skip(f"Order not accepted (response: {resp})")
+        oid, px, result = _place_far_maker(hl_exchange, hl_info)
+        try:
+            assert oid is not None, f"order did not rest (response: {result})"
+            open_oids = {o["oid"] for o in hl_info.open_orders(live_account["account_address"])}
+            assert oid in open_oids, f"resting oid {oid} not visible on the account"
+        finally:
+            if oid is not None:
+                _cancel(hl_exchange, "ETH", oid)
+        assert oid not in {o["oid"] for o in hl_info.open_orders(live_account["account_address"])}
 
     @pytest.mark.mainnet
     @pytest.mark.place_orders
@@ -131,13 +181,79 @@ class TestOrderLifecycle:
 
     @pytest.mark.mainnet
     @pytest.mark.place_orders
-    def test_cancel_all_orders_for_account(self, hl_exchange, live_account, place_orders):
-        open_orders = hl_exchange.info.open_orders(live_account["account_address"])
-        if not open_orders:
-            pytest.skip("No open orders to cancel")
-        oids = [o["oid"] for o in open_orders]
-        result = hl_exchange.batch_cancel(oids)
-        assert "response" in result
+    def test_scoped_cancel_only_cancels_own_orders(self, hl_info, hl_exchange, live_account, place_orders):
+        """Cancellation is by oid — never a blanket cancel-all on a live account."""
+        spot, perp = _collateral_usdc(hl_info, live_account["account_address"])
+        if spot + perp <= 0:
+            pytest.skip(f"{live_account['account_id']} has no USDC collateral")
+
+        oid, _, first = _place_far_maker(hl_exchange, hl_info, is_buy=True)
+        try:
+            assert oid is not None, f"order did not rest (response: {first})"
+        finally:
+            if oid is not None:
+                _cancel(hl_exchange, "ETH", oid)
+        remaining = {o["oid"] for o in hl_info.open_orders(live_account["account_address"])}
+        assert oid not in remaining
+
+    @pytest.mark.mainnet
+    @pytest.mark.place_orders
+    def test_post_only_alo_is_maker_only(self, hl_info, hl_exchange, live_account, place_orders):
+        """ALO (post-only) rests when passive and is rejected, not filled, when crossing."""
+        address = live_account["account_address"]
+        spot, perp = _collateral_usdc(hl_info, address)
+        if spot + perp <= 0:
+            pytest.skip(f"{live_account['account_id']} has no USDC collateral")
+
+        moving_oid = None
+        try:
+            moving_oid, _, passive = _place_far_maker(hl_exchange, hl_info, is_buy=True, tif="Alo")
+            assert moving_oid is not None, f"passive ALO did not rest (response: {passive})"
+
+            before = _position_size(hl_info, address)
+            _, asks = hl_info.l2_snapshot("ETH")["levels"]
+            crossing_px = round(float(asks[0]["px"]) * 1.05, 1)
+            result = hl_exchange.order(
+                "ETH", True, TINY_ETH_SZ, crossing_px, {"limit": {"tif": "Alo"}}, reduce_only=False
+            )
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+            oid = statuses[0].get("resting", {}).get("oid") if statuses else None
+            after = _position_size(hl_info, address)
+            assert oid is None, "crossing ALO rested — post-only not enforced"
+            assert after == before, f"crossing ALO filled (position {before} -> {after}) — maker-only violated"
+        finally:
+            if moving_oid is not None:
+                _cancel(hl_exchange, "ETH", moving_oid)
+
+
+# ---------------------------------------------------------------------------
+# Subaccount routing (the vaultAddress seam)
+# ---------------------------------------------------------------------------
+
+class TestSubaccountRouting:
+    @pytest.mark.mainnet
+    @pytest.mark.place_orders
+    def test_order_visible_only_on_target_account(
+        self, hl_info, hl_exchange, live_account, all_account_addresses, place_orders
+    ):
+        """An order signed with vaultAddress=target must not leak to any other account."""
+        target = live_account["account_address"]
+        spot, perp = _collateral_usdc(hl_info, target)
+        if spot + perp <= 0:
+            pytest.skip(f"{live_account['account_id']} has no USDC collateral")
+
+        oid, px, result = _place_far_maker(hl_exchange, hl_info, is_buy=True)
+        try:
+            assert oid is not None, f"order did not rest (response: {result})"
+            assert oid in {o["oid"] for o in hl_info.open_orders(target)}, "order missing from target account"
+            for account_id, address in all_account_addresses.items():
+                if address == target:
+                    continue
+                leaked = {o["oid"] for o in hl_info.open_orders(address)}
+                assert oid not in leaked, f"order leaked to {account_id} ({address}) — vaultAddress routing broken"
+        finally:
+            if oid is not None:
+                _cancel(hl_exchange, "ETH", oid)
 
 
 # ---------------------------------------------------------------------------

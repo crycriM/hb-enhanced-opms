@@ -89,19 +89,103 @@ def test_deposit_first_converts_bins_to_price_range():
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
     bridge._client = httpx.Client(transport=t, base_url="http://mock")
-    r = bridge.deposit_single_sided("pool1", "bid", [1, 2], [10.0, 20.0])
+    r = bridge.deposit_single_sided(
+        "pool1", "bid", [-2, -1], [10.0, 20.0],
+        expected_active_bin=0, max_active_bin_slippage=2,
+    )
     assert r.ok
     assert bridge._positions.get("pool1") == "pos_new"
     assert r.data["position_id"] == "pos_new"
 
     body = next(b for p, b in recorder if p == "/connectors/meteora/clmm/open-position")
     step = 1.008
-    assert body["lowerPrice"] == pytest.approx(100.0 * step ** 1)
-    assert body["upperPrice"] == pytest.approx(100.0 * step ** 2)
+    assert body["lowerPrice"] == pytest.approx(100.0 * step ** -2)
+    assert body["upperPrice"] == pytest.approx(100.0 * step ** -1)
     assert body["quoteTokenAmount"] == 30.0   # bid side: quote only
     assert body["baseTokenAmount"] == 0
     assert body["strategyType"] == 0          # Spot
+    assert body["slippagePct"] == 1.6         # 2 bins * 80 bps/bin
     assert "binIds" not in body and "amounts" not in body
+    bridge._client.close()
+
+
+def test_deposit_rejects_active_bin_drift_before_gateway_write():
+    recorder = []
+    bridge = GatewayExecBridge(GatewayConfig(wallet="w1"))
+    bridge._client = httpx.Client(
+        transport=_transport({}, recorder=recorder), base_url="http://mock"
+    )
+
+    result = bridge.deposit_single_sided(
+        "pool1", "bid", [-2, -1], [10.0, 20.0],
+        expected_active_bin=3, max_active_bin_slippage=2,
+    )
+
+    assert not result.ok
+    assert result.error == "active_bin_slippage_exceeded"
+    assert recorder == []
+    bridge._client.close()
+
+
+def test_deposit_uses_only_remaining_active_bin_tolerance():
+    recorder = []
+    bridge = GatewayExecBridge(GatewayConfig(wallet="w1"))
+    bridge._client = httpx.Client(
+        transport=_transport({
+            "/connectors/meteora/clmm/open-position": {
+                "status": 200,
+                "body": {"positionAddress": "pos_new", "signature": "sig1"},
+            },
+        }, recorder=recorder),
+        base_url="http://mock",
+    )
+
+    result = bridge.deposit_single_sided(
+        "pool1", "bid", [-2, -1], [10.0, 20.0],
+        expected_active_bin=1, max_active_bin_slippage=2,
+    )
+
+    assert result.ok
+    body = next(b for p, b in recorder if p == "/connectors/meteora/clmm/open-position")
+    assert body["slippagePct"] == 0.8  # one of two allowed bins already consumed
+    bridge._client.close()
+
+
+def test_deposit_rejects_tolerance_above_gateway_policy_cap():
+    recorder = []
+    bridge = GatewayExecBridge(
+        GatewayConfig(wallet="w1", max_active_bin_slippage_bins=1)
+    )
+    bridge._client = httpx.Client(
+        transport=_transport({}, recorder=recorder), base_url="http://mock"
+    )
+
+    result = bridge.deposit_single_sided(
+        "pool1", "bid", [-2, -1], [10.0, 20.0],
+        expected_active_bin=0, max_active_bin_slippage=2,
+    )
+
+    assert not result.ok
+    assert result.error == "policy_rejected"
+    assert recorder == []
+    bridge._client.close()
+
+
+def test_deposit_zero_tolerance_fails_closed_on_legacy_gateway():
+    recorder = []
+    bridge = GatewayExecBridge(GatewayConfig(wallet="w1"))
+    bridge._client = httpx.Client(
+        transport=_transport({}, recorder=recorder), base_url="http://mock"
+    )
+
+    result = bridge.deposit_single_sided(
+        "pool1", "bid", [-2, -1], [10.0, 20.0],
+        expected_active_bin=0, max_active_bin_slippage=0,
+    )
+
+    assert not result.ok
+    assert result.error == "policy_rejected"
+    assert recorder == []
     bridge._client.close()
 
 
@@ -117,7 +201,10 @@ def test_deposit_second_routes_to_add_liquidity():
     bridge = GatewayExecBridge(cfg)
     bridge._client = httpx.Client(transport=t, base_url="http://mock")
     bridge._positions["pool1"] = "pos1"
-    r = bridge.deposit_single_sided("pool1", "ask", [3], [15.0])
+    r = bridge.deposit_single_sided(
+        "pool1", "ask", [3], [15.0],
+        expected_active_bin=0, max_active_bin_slippage=3,
+    )
     assert r.ok
 
     body = next(b for p, b in recorder if p == "/connectors/meteora/clmm/add-liquidity")
@@ -202,7 +289,8 @@ def test_refresh_bundle_success():
     r = bridge.refresh_bundle(
         "pos1",
         None,
-        {"pool": "pool1", "bid_bins": [1], "bid_amounts": [10.0], "ask_bins": [3], "ask_amounts": [20.0]},
+        {"pool": "pool1", "bid_bins": [-1], "bid_amounts": [10.0], "ask_bins": [3], "ask_amounts": [20.0],
+         "expected_active_bin": 0, "max_active_bin_slippage": 2},
     )
     assert r.ok
     assert "/connectors/meteora/clmm/close-position" in call_log
@@ -230,7 +318,8 @@ def test_refresh_bundle_swap_fail_continues():
     r = bridge.refresh_bundle(
         "pos1",
         {"in_mint": "A", "out_mint": "B", "amount": 100.0},
-        {"pool": "pool1", "bid_bins": [1], "bid_amounts": [10.0], "ask_bins": [], "ask_amounts": []},
+        {"pool": "pool1", "bid_bins": [-1], "bid_amounts": [10.0], "ask_bins": [], "ask_amounts": [],
+         "expected_active_bin": 0, "max_active_bin_slippage": 2},
     )
     assert r.ok
     assert "/connectors/meteora/clmm/execute-swap" in call_log

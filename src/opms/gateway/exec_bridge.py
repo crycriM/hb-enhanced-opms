@@ -33,6 +33,7 @@ class GatewayConfig:
     timeout: float = 30.0
     base_decimals: int = 9
     quote_decimals: int = 6
+    max_active_bin_slippage_bins: int = 3
 
 
 class GatewayExecBridge:
@@ -95,7 +96,11 @@ class GatewayExecBridge:
         d = anchor.data
         price, active_bin, bin_step_bps = float(d["price"]), int(d["activeBinId"]), int(d["binStep"])
         step = 1.0 + bin_step_bps / 1e4
-        return ExecResult(ok=True, data={"fn": lambda bin_id: price * step ** (bin_id - active_bin)})
+        return ExecResult(ok=True, data={
+            "fn": lambda bin_id: price * step ** (bin_id - active_bin),
+            "active_bin": active_bin,
+            "bin_step_bps": bin_step_bps,
+        })
 
     @staticmethod
     def _extract_sigs(raw: dict) -> list[str]:
@@ -201,15 +206,43 @@ class GatewayExecBridge:
         bin_ids: list[int],
         amounts: list[float],
         strategy_type: str = "Spot",
+        *,
+        expected_active_bin: int,
+        max_active_bin_slippage: int,
     ) -> ExecResult:
-        """Collapses the keeper's per-bin ladder levels for one side into a
-        single canned-strategy sub-position spanning [min(bin_ids),
-        max(bin_ids)] — the PWL-tiling insight (common-STATUS.md §4): Gateway has no
-        per-bin control, but one flat Spot tile per side is a valid (if
-        coarse) first cut. Multi-segment AS-skew tiling is future work."""
+        """Legacy compatibility path; not the M4 precise-deposit authority.
+
+        Gateway has no precise-bin route, so this collapses the keeper's levels
+        into one canned-strategy price range. It cannot satisfy the exact-bin
+        M4 contract and must not be selected as the production write path."""
+        if max_active_bin_slippage < 0:
+            return ExecResult(ok=False, error="bad_request")
+        # Older Gateway/Meteora SDK paths interpret slippagePct=0 as "unset"
+        # and silently apply their default. This legacy bridge cannot promise
+        # the shared contract's zero-bin tolerance, so it must fail closed.
+        if max_active_bin_slippage == 0:
+            return ExecResult(ok=False, error="policy_rejected")
+        if max_active_bin_slippage > self.cfg.max_active_bin_slippage_bins:
+            return ExecResult(ok=False, error="policy_rejected")
         anchor = self._bin_price_fn(pool)
         if not anchor.ok:
             return anchor
+        current_active_bin = int(anchor.data["active_bin"])
+        consumed_tolerance = abs(current_active_bin - expected_active_bin)
+        if consumed_tolerance > max_active_bin_slippage:
+            return ExecResult(ok=False, error="active_bin_slippage_exceeded")
+        remaining_tolerance = max_active_bin_slippage - consumed_tolerance
+        if remaining_tolerance == 0:
+            return ExecResult(ok=False, error="policy_rejected")
+
+        def crosses(active: int) -> bool:
+            return (
+                (side == "bid" and any(bin_id >= active for bin_id in bin_ids))
+                or (side == "ask" and any(bin_id < active for bin_id in bin_ids))
+            )
+        for active in (expected_active_bin, current_active_bin):
+            if crosses(active):
+                return ExecResult(ok=False, error="bins_cross_active")
         price_of = anchor.data["fn"]
         lower_price, upper_price = price_of(min(bin_ids)), price_of(max(bin_ids))
         total = sum(amounts)
@@ -228,7 +261,10 @@ class GatewayExecBridge:
             "baseTokenAmount": total if side == "ask" else 0,
             "quoteTokenAmount": total if side == "bid" else 0,
             "strategyType": self._STRATEGY_INT.get(strategy_type, 0),
-            "slippagePct": 1.0,
+            # Gateway accepts percent while the shared contract uses bin count.
+            "slippagePct": (
+                remaining_tolerance * anchor.data["bin_step_bps"] / 100
+            ),
         }
         if existing_pos:
             body["positionAddress"] = existing_pos
@@ -296,17 +332,27 @@ class GatewayExecBridge:
         ask_bins = deposit_spec.get("ask_bins", [])
         bid_amounts = deposit_spec.get("bid_amounts", [])
         ask_amounts = deposit_spec.get("ask_amounts", [])
+        expected_active_bin = deposit_spec["expected_active_bin"]
+        max_active_bin_slippage = deposit_spec["max_active_bin_slippage"]
 
         step_results = [withdraw_r]
         if swap_spec and 'swap_r' in locals():
             step_results.append(swap_r)
         if bid_bins:
-            r = self.deposit_single_sided(pool, "bid", bid_bins, bid_amounts)
+            r = self.deposit_single_sided(
+                pool, "bid", bid_bins, bid_amounts,
+                expected_active_bin=expected_active_bin,
+                max_active_bin_slippage=max_active_bin_slippage,
+            )
             step_results.append(r)
             if not r.ok:
                 return ExecResult(ok=False, error=f"refresh_bundle: bid deposit failed: {r.error}")
         if ask_bins:
-            r = self.deposit_single_sided(pool, "ask", ask_bins, ask_amounts)
+            r = self.deposit_single_sided(
+                pool, "ask", ask_bins, ask_amounts,
+                expected_active_bin=expected_active_bin,
+                max_active_bin_slippage=max_active_bin_slippage,
+            )
             step_results.append(r)
             if not r.ok:
                 return ExecResult(ok=False, error=f"refresh_bundle: ask deposit failed: {r.error}")

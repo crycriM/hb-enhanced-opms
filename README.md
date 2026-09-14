@@ -80,18 +80,32 @@ env.
 ### Hummingbot dependency deployment
 
 Hummingbot is the "body" that actually places orders. Create its conda env
-(named `hummingbot-venv`) from the Hummingbot checkout's `setup/environment.yml`,
-then install the monorepo deps + OPMS into that same env:
+(named `hummingbot`; older docs call it `hummingbot-venv`), compile Hummingbot
+itself, then install the monorepo deps + OPMS into that same env:
 
 ```bash
 # 1. Create the conda env from the Hummingbot checkout's environment.yml
 conda env create -f <hummingbot-checkout>/setup/environment.yml
-conda activate hummingbot-venv
+conda activate hummingbot
 
-# 2. Install the monorepo dependencies + OPMS into that env
+# 2. Compile + install Hummingbot ITSELF. This is the step that makes
+#    `import hummingbot` work: the checkout ships ~60 Cython .pyx sources and
+#    no .so files, so without it `import hummingbot.connector.connector_base`
+#    fails. `./install` does the same thing plus the env create/update.
+cd <hummingbot-checkout>
+pip install -e . --no-deps --no-build-isolation
+
+# 3. Install the monorepo dependencies + OPMS into that same env
 pip install -e ../mm-core
 pip install -e ../perp-bot
 pip install -e .          # this package (opms)
+```
+
+Verify the runtime is real before trusting it:
+
+```bash
+python -c "import hummingbot.connector.connector_base as cb; print(cb.__file__)"
+python -m pytest tests_real/ -q     # real-HB tests, no stubs
 ```
 
 Notes:
@@ -128,9 +142,21 @@ subaccount-auth mechanics and the rule to use an **agent-wallet** key for
 - **Live path (`hb-enhanced-opms` + Hummingbot connector):** the wallet
   credentials are imported once into Hummingbot's encrypted
   `conf/connectors/` store — via `scripts/import_hl_testnet_credentials.py`
-  or HB's interactive `connect` command — and are **not** read from `.env` at
+  (testnet) / `scripts/import_hl_mainnet_credentials.py` (mainnet) or HB's
+  interactive `connect` command — and are **not** read from `.env` at
   runtime. The running controller's `PerpMMControllerConfig.connector_name`
   selects the wallet; `venue`/`account_id` are routing labels only.
+
+**Mainnet subaccount routing.** `scripts/import_hl_mainnet_credentials.py`
+imports either the master (`use_vault=False`) or a subaccount
+(`use_vault=True`, `address=<subaccount>`, secret = the *same* master-approved
+agent key), auto-detecting which from `HYPERLIQUID_MASTER_ACCOUNT_ADDRESS`.
+HB's connector then signs every request with `vaultAddress=<subaccount>`
+(`HyperliquidPerpetualAuth._vault_address`). ⚠ Hummingbot keys credentials by
+**connector name**, and there is only one `hyperliquid_perpetual` slot — so a
+subaccount import overwrites a master import, and running `e2_mm1` and
+`e2_mm2` concurrently needs two separate HB instances (or a future
+connector-name split). Verify with `--dry-run` before importing.
 - **`dex_executor`'s `AccountRegistry`:** reads `{EXCHANGE}_{ACCOUNT_ID}_...`
   vars from the environment live. This path is currently bypassed for live HL
   trading.
@@ -184,6 +210,27 @@ pytest tests/test_historical_profile.py
 ```
 
 Tests do not require a live Hummingbot runtime. The `conftest.py` injects stub modules covering all HB types (enums, events, data types) and the `ExecutorBase` interface.
+
+**Run `tests_real/` in its own invocation** — it deliberately does *not* use the
+stubs and imports the real Hummingbot, so it must not share a process with
+`tests/` (whose conftest injects stubs into `sys.modules`):
+
+```bash
+pytest tests_real/ -q                                  # real-HB controller + connector structure
+OPMS_HB_MAINNET=confirm pytest tests_real/ -q          # also reads the real HL mainnet connector (no orders)
+```
+
+`tests_real/` skips automatically when Hummingbot is not importable. It caught
+three real bugs the stub suite masked: `PerpMMController` imported a
+`TwapExecutorConfig` that does not exist in Hummingbot (the real class is
+`TWAPExecutorConfig`, with `total_amount_quote`/`total_duration`/
+`order_interval`), the custom `PassiveAggressiveExecutorConfig` type was never
+registered in HB's `ExecutorOrchestrator._executor_mapping` (so every
+de-risk/emergency executor would have raised "Unsupported executor config
+type"), and `_current_equity()` looked up `"USDC"` while HB's Hyperliquid
+connector reports the balance under `"USD"` (silent zero equity). All three are
+fixed; `PerpMMController` now registers the executor at import time and
+resolves equity against the connector's actual balances.
 
 ## Dependency layout
 

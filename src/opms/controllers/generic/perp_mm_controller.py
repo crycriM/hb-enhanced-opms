@@ -13,8 +13,9 @@ from pydantic import Field
 
 from hummingbot.core.data_type.common import PositionAction, PriceType, TradeType
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
+from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
-from hummingbot.strategy_v2.executors.twap_executor.data_types import TwapExecutorConfig
+from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig, TWAPMode
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 
 from mm_core.inventory import Caps
@@ -24,7 +25,7 @@ from perp_bot.keeper import Keeper
 from perp_bot.opms_client import Position
 
 from opms.analytics.fill_observer import FillObserver
-from opms.executors.passive_aggressive_executor import PassiveAggressiveExecutorConfig
+from opms.executors.passive_aggressive_executor import PassiveAggressiveExecutor, PassiveAggressiveExecutorConfig
 
 from .perp_mm_bridge import (
     ExecutionRequest,
@@ -32,6 +33,14 @@ from .perp_mm_bridge import (
     intent_is_quoting,
     intent_to_execution_request,
     intent_to_order_specs,
+)
+
+# HB's ExecutorOrchestrator only knows its built-in executors. Register the
+# passive-aggressive executor so a CreateExecutorAction carrying our config
+# type maps to a real executor instead of raising "Unsupported executor config
+# type" when the controller routes a de-risk/emergency intent.
+ExecutorOrchestrator._executor_mapping.setdefault(
+    "passive_aggressive_executor", PassiveAggressiveExecutor
 )
 
 
@@ -50,7 +59,10 @@ class PerpMMControllerConfig(ControllerConfigBase):
     max_position: float = 10.0
     critical_position: float = 20.0
     leverage: int = 1
-    collateral_asset: str = "USDC"
+    # The quote/collateral asset label the connector reports balances under.
+    # Hummingbot's Hyperliquid connector uses "USD" (CONSTANTS.CURRENCY), not
+    # "USDC" — _current_equity also falls back across common labels.
+    collateral_asset: str = "USD"
     decision_log_path: str | None = None
 
     @property
@@ -123,9 +135,21 @@ class PerpMMController(ControllerBase):
         return total
 
     def _current_equity(self) -> Decimal:
-        # Cross-margined account value (collateral + unrealized PnL), same
-        # source HB's own balance display uses.
-        return self.market_data_provider.get_balance(self.config.connector_name, self.config.collateral_asset)
+        # Cross-margined account value (collateral + unrealized PnL), resolved
+        # against the connector's actual balances. HB's Hyperliquid connector
+        # labels the balance "USD" (CONSTANTS.CURRENCY), not "USDC" — trusting
+        # the label alone yields a silent 0 equity.
+        balances = self.market_data_provider.get_connector(
+            self.config.connector_name
+        ).get_all_balances()
+        if balances.get(self.config.collateral_asset):
+            return Decimal(str(balances[self.config.collateral_asset]))
+        for asset in ("USD", "USDC", "USDT"):
+            if balances.get(asset):
+                return Decimal(str(balances[asset]))
+        if len(balances) == 1:
+            return Decimal(str(next(iter(balances.values()))))
+        return Decimal("0")
 
     def _execution_actions(self, req: ExecutionRequest) -> list[ExecutorAction]:
         ts = self.market_data_provider.time()
@@ -146,13 +170,18 @@ class PerpMMController(ControllerBase):
             return [CreateExecutorAction(controller_id=self.config.id, executor_config=config)]
 
         if req.urgency == "immediate":
-            config = TwapExecutorConfig(
+            mid = self.get_current_price(
+                self.config.connector_name, self.config.trading_pair, PriceType.MidPrice
+            )
+            config = TWAPExecutorConfig(
                 timestamp=ts,
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
                 side=side,
-                total_amount_base=Decimal(str(req.amount)),
-                duration_seconds=120,
+                total_amount_quote=Decimal(str(req.amount)) * Decimal(str(mid)),
+                total_duration=120,
+                order_interval=30,
+                mode=TWAPMode.TAKER,
                 leverage=self.config.leverage,
             )
             return [CreateExecutorAction(controller_id=self.config.id, executor_config=config)]

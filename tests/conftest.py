@@ -156,19 +156,30 @@ def _mk(**attrs):
 class ExecutionStrategy(Enum):
     MARKET = "MARKET"
     LIMIT_MAKER = "LIMIT_MAKER"
+    LIMIT = "LIMIT"
+    LIMIT_CHASER = "LIMIT_CHASER"
 
 
-class TwapExecutorConfig:
-    """Minimal stub for TwapExecutorConfig — enough to check .type and .duration_seconds."""
+class TWAPMode(Enum):
+    MAKER = "MAKER"
+    TAKER = "TAKER"
+
+
+class TWAPExecutorConfig:
+    """Stub mirroring the real HB class name and fields (total_amount_quote,
+    total_duration, order_interval, mode) so a regression to the non-existent
+    ``TwapExecutorConfig``/``duration_seconds`` shape is caught."""
     type = "twap_executor"
-    def __init__(self, timestamp, connector_name, trading_pair, side, total_amount_base,
-                 duration_seconds=120, leverage=1):
+    def __init__(self, timestamp, connector_name, trading_pair, side, total_amount_quote,
+                 total_duration=120, order_interval=30, mode=TWAPMode.TAKER, leverage=1):
         self.timestamp = timestamp
         self.connector_name = connector_name
         self.trading_pair = trading_pair
         self.side = side
-        self.total_amount_base = total_amount_base
-        self.duration_seconds = duration_seconds
+        self.total_amount_quote = total_amount_quote
+        self.total_duration = total_duration
+        self.order_interval = order_interval
+        self.mode = mode
         self.leverage = leverage
 
 
@@ -186,6 +197,15 @@ class OrderExecutorConfig:
         self.execution_strategy = execution_strategy
         self.position_action = position_action
         self.leverage = leverage
+
+
+class ExecutorOrchestrator:
+    """Stub exposing the mapping the controller registers its PA executor into."""
+    _executor_mapping = {
+        "position_executor": "PositionExecutor",
+        "order_executor": OrderExecutorConfig,
+        "twap_executor": TWAPExecutorConfig,
+    }
 
 
 _HB_STUBS = {
@@ -230,10 +250,15 @@ _HB_STUBS = {
     "hummingbot.strategy_v2.executors": MagicMock(),
     "hummingbot.strategy_v2.executors.data_types": _mk(ExecutorConfigBase=MagicMock),
     "hummingbot.strategy_v2.executors.executor_base": _mk(ExecutorBase=ExecutorBase),
+    "hummingbot.strategy_v2.executors.executor_orchestrator": _mk(ExecutorOrchestrator=ExecutorOrchestrator),
     "hummingbot.strategy_v2.executors.twap_executor": MagicMock(),
-    "hummingbot.strategy_v2.executors.twap_executor.data_types": _mk(TwapExecutorConfig=TwapExecutorConfig),
+    "hummingbot.strategy_v2.executors.twap_executor.data_types": _mk(
+        TWAPExecutorConfig=TWAPExecutorConfig, TWAPMode=TWAPMode
+    ),
     "hummingbot.strategy_v2.executors.order_executor": MagicMock(),
-    "hummingbot.strategy_v2.executors.order_executor.data_types": _mk(OrderExecutorConfig=OrderExecutorConfig),
+    "hummingbot.strategy_v2.executors.order_executor.data_types": _mk(
+        OrderExecutorConfig=OrderExecutorConfig, ExecutionStrategy=ExecutionStrategy
+    ),
     "hummingbot.strategy_v2.models": MagicMock(),
     "hummingbot.strategy_v2.models.base": _mk(RunnableStatus=RunnableStatus),
     "hummingbot.strategy_v2.models.executors": _mk(CloseType=CloseType, TrackedOrder=TrackedOrder),

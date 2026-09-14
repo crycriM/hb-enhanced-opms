@@ -28,6 +28,7 @@ collects fill-level PnL / markout / slippage analytics. `hb` == **Hummingbot** e
 
 - Test Driven Design: write tests first, confirm they FAIL, commit, then implement. One task per loop. Update planning docs, commit after completion.
 - `pytest` is the test runner. Tests need NO live Hummingbot runtime — `conftest.py` injects stub HB modules via `sys.modules` (enums, events, data types, `ExecutorBase`).
+- `tests_real/` is the opposite: no stubs, imports the **real** Hummingbot, and must run in its own invocation (`pytest tests_real/`). It skips if Hummingbot isn't importable. Use it whenever you touch `perp_mm_controller.py` or executor config types — the stubs are MagicMock-permissive and have already hidden a non-existent HB class name once. `OPMS_HB_MAINNET=confirm pytest tests_real/` additionally reads the real HL mainnet connector (no orders).
 - Keep algorithm math (`_ac_math`) pure: no I/O, no asyncio, no service deps, HB-free, independently testable.
 - Editing: prefer `patch` with unique context over `write_file`. Re-read the file first; patch hallucinates old_string often.
 - When prompting for selection, list items numbered (1, 2, 3...). Never ask more than one yes/no question.

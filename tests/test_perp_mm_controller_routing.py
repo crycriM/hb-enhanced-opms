@@ -125,12 +125,12 @@ class TestExecutionRouting:
         assert c.child_order_refresh_time == 5.0
 
     def test_immediate_routes_to_twap(self, config, md):
-        """immediate → TwapExecutorConfig."""
+        """immediate → TWAPExecutorConfig (real HB class name)."""
         req = ExecutionRequest(side="sell", amount=5.0, urgency="immediate", reduce_only=True)
         actions = _exec_actions(req, config, md)
         c = actions[0]["config"]
         assert c.type == "twap_executor"
-        assert c.duration_seconds == 120
+        assert c.total_duration == 120
 
     def test_emergency_below_min_size_falls_back(self, config, md):
         """emergency below min_order_size → OrderExecutorConfig MARKET."""
@@ -186,15 +186,15 @@ def _exec_actions(req: ExecutionRequest, config, md):
         return [{"config": c}]
 
     if req.urgency == "immediate":
-        from hummingbot.strategy_v2.executors.twap_executor.data_types import TwapExecutorConfig
-        c = TwapExecutorConfig(
+        from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig
+        c = TWAPExecutorConfig(
             timestamp=ts,
             connector_name=config.connector_name,
             trading_pair=config.trading_pair,
             side=side,
-            total_amount_base=Decimal(str(req.amount)),
-            duration_seconds=120,
-            leverage=config.leverage,
+            total_amount_quote=Decimal(str(req.amount)),
+            total_duration=120,
+            order_interval=30,
         )
         return [{"config": c}]
 
