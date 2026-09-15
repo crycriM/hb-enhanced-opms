@@ -206,7 +206,9 @@ class ACScheduleExecutor(ExecutorBase):
         if self.status == RunnableStatus.RUNNING:
             await self._tick()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
-            self.close_execution_by(CloseType.COMPLETED)
+            # early_stop() already chose EARLY_STOP / POSITION_HOLD; a run that
+            # exhausted its schedule closes with the outcome-true type instead.
+            self.close_execution_by(self.close_type or self._final_close_type())
 
     # ------------------------------------------------------------------
     # Main logic
@@ -223,7 +225,7 @@ class ACScheduleExecutor(ExecutorBase):
         if self._slice_idx >= len(self._schedule):
             # All slices submitted; wait for outstanding fills.
             if self._all_done():
-                self.close_execution_by(CloseType.COMPLETED)
+                self.close_execution_by(self._final_close_type())
             return
 
         # Pace slices: submit when the current interval has elapsed.
@@ -370,6 +372,21 @@ class ACScheduleExecutor(ExecutorBase):
         self.close_timestamp = self._strategy.current_timestamp
         self._status = RunnableStatus.TERMINATED
         self.stop()
+
+    def _final_close_type(self) -> CloseType:
+        """Close type must describe what happened, not merely that the run ended."""
+        if self._current_retries > self._max_retries:
+            return CloseType.FAILED
+        if self._cumulative_filled >= self.config.total_amount_base:
+            return CloseType.COMPLETED
+        logger.warning(
+            f"AC: closing under-filled ({self._cumulative_filled}/{self.config.total_amount_base}) — TIME_LIMIT"
+        )
+        return CloseType.TIME_LIMIT
+
+    def evaluate_max_retries(self) -> None:
+        if self._current_retries > self._max_retries:
+            self.close_execution_by(CloseType.FAILED)
 
 
 __all__ = ["ACScheduleExecutorConfig", "ACScheduleExecutor"]

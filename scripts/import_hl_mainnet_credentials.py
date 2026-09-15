@@ -23,7 +23,7 @@ Required env vars:
   HYPERLIQUID_<ACCOUNT_ID>_PRIVATE_KEY
 
 Optional:
-  HYPERLIQUID_MASTER_ACCOUNT_ADDRESS   # used to auto-detect subaccount -> use_vault
+  HYPERLIQUID_MASTER_ACCOUNT_ADDRESS   # auto-detects subaccount -> use_vault (falls back to HYPERLIQUID_E2_MAIN_ACCOUNT_ADDRESS)
   HB_USE_VAULT=yes|no                  # explicit override of the auto-detection
 
 Usage (inside the HB env):
@@ -33,6 +33,11 @@ Usage (inside the HB env):
 
 import argparse
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")  # monorepo credential store; never overrides the shell
 
 MASTER_ADDRESS_VAR = "HYPERLIQUID_MASTER_ACCOUNT_ADDRESS"
 
@@ -51,7 +56,7 @@ def _resolve(account_id: str, use_vault_override: str | None) -> dict:
     if not os.environ.get("HB_PASSWORD"):
         raise SystemExit("Missing HB_PASSWORD (encrypts the credential store)")
 
-    master = os.environ.get(MASTER_ADDRESS_VAR, "").lower()
+    master = (os.environ.get(MASTER_ADDRESS_VAR) or _account_env("e2_main", "ACCOUNT_ADDRESS") or "").lower()
     if use_vault_override is not None:
         use_vault = use_vault_override.strip().lower() in {"yes", "y", "true", "1"}
     elif master:

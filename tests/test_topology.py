@@ -28,6 +28,13 @@ class TestVenueCapabilities:
         assert caps.position_mode == "hedge"
         assert caps.supports_same_account_hedge is True
 
+    def test_lighter_net_matches_perp_bot(self):
+        # regression: this module's own table still said hedge after perp_bot was fixed
+        assert get_venue_capabilities("lighter_perpetual").position_mode == "net"
+
+    def test_testnet_connector_suffix(self):
+        assert get_venue_capabilities("hyperliquid_perpetual_testnet").position_mode == "net"
+
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown connector"):
             get_venue_capabilities("nonexistent")

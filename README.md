@@ -108,6 +108,15 @@ python -c "import hummingbot.connector.connector_base as cb; print(cb.__file__)"
 python -m pytest tests_real/ -q     # real-HB tests, no stubs
 ```
 
+⚠ **Local patch to the pinned checkout.** The HL WS funding parser
+(`hyperliquid_perpetual_api_order_book_data_source.py::_parse_funding_info_message`)
+used `ctx.get("openInterest", ctx.get("funding", "0"))` as the rate. HL's
+`activeAssetCtx` payload carries both fields, so the connector reported open
+interest (~1e6) as funding — which the keeper would accrue as funding PnL on
+every tick. It is patched locally to `ctx.get("funding", "0")`. **Re-apply
+after any Hummingbot update.** `scripts/run_hb_mainnet_smoke.py` fails if the
+rate is implausible (≥ 0.01), so the regression is caught.
+
 Notes:
 
 - One venv per project (see the monorepo `AGENTS.md`). This is the deliberate
@@ -218,6 +227,67 @@ stubs and imports the real Hummingbot, so it must not share a process with
 ```bash
 pytest tests_real/ -q                                  # real-HB controller + connector structure
 OPMS_HB_MAINNET=confirm pytest tests_real/ -q          # also reads the real HL mainnet connector (no orders)
+```
+
+The full network smoke — start the connector, call the real `on_start()` /
+`update_processed_data()`, and check mid / funding / equity / analytics — is a
+standalone script rather than a pytest test, because HB connectors spawn
+background tasks that outlive pytest-asyncio's per-test event loop:
+
+```bash
+OPMS_HB_MAINNET=confirm python scripts/run_hb_mainnet_smoke.py --account-id e2_mm1
+```
+
+The **write** gate places real orders: the controller's own quote becomes two
+tiny `LIMIT_MAKER` (HL `Alo`) orders through real `OrderExecutor`s, which must
+rest only on the target subaccount, refresh, and cancel to 0 orders / 0
+position. Prices are pushed `--passive-bps` through the touch so nothing fills,
+notional is capped by `--max-notional`, and leftovers are force-cancelled (or
+market-closed) through the raw HL SDK. Run `--dry-run` first; artifacts
+(`gate.json`, `decisions.jsonl`, `gate.log`) land in `logs/quote_gate_<ts>/`:
+
+```bash
+OPMS_HB_MAINNET=confirm OPMS_HB_PLACE_ORDERS=confirm \
+  python scripts/run_hb_mainnet_quote_gate.py --account-id e2_mm1 --max-position 0.06 --dry-run
+```
+
+HL rejects orders under $10 notional; quote size is 10% of `--max-position`,
+so size it against the current mid.
+
+The **de-risk** gate opens a real micro position (default 0.012 ETH, ~$30),
+lets the keeper's own risk policy flatten it through a reduce-only
+`PassiveAggressiveExecutor`, re-opens, injects a drawdown, and requires the
+emergency exit to go flat within `--emergency-deadline` seconds. It drives the
+controller at real control-cycle cadence (`--cycle-s`) and never executes quote
+creates. Takes ~3–5 minutes:
+
+```bash
+OPMS_HB_MAINNET=confirm OPMS_HB_PLACE_ORDERS=confirm \
+  python scripts/run_hb_mainnet_derisk_gate.py --account-id e2_mm1 --dry-run
+```
+
+### Real Hummingbot launch (`deploy/`)
+
+`deploy/hummingbot/` mirrors the HB root and is symlinked into the checkout by
+`deploy/install_into_hummingbot.sh` (re-run after an HB update):
+
+- `scripts/opms_perp_mm.py` — `V2WithControllers` plus two start-time refusals
+  HB lacks (its `add_controller()` only logs constructor errors): topology
+  violations, and credentials that route to a different account than the
+  controller's `account_id` (HB has one `hyperliquid_perpetual` slot).
+- `controllers/generic/perp_mm.py` — re-exports `PerpMMController` where HB's
+  loader looks (`controllers.<controller_type>.<controller_name>`).
+- `conf/scripts/opms_perp_mm_e2_mm1_shadow.yml` +
+  `conf/controllers/perp_mm_e2_mm1_eth_shadow.yml` — one untilted ETH
+  controller on `e2_mm1`, `shadow_mode: true`, micro caps, 5 s cycle.
+
+One-time: choose an HB password, put `HB_PASSWORD=...` in the monorepo `.env`,
+then `python scripts/import_hl_mainnet_credentials.py --account-id e2_mm1`.
+A shadow session (no orders) followed by Phase-1 parity — the HB log replayed
+through a standalone `Keeper` (`perp-bot/scripts/replay_decision_log.py`):
+
+```bash
+deploy/run_shadow_session.sh 1800   # seconds
 ```
 
 `tests_real/` skips automatically when Hummingbot is not importable. It caught

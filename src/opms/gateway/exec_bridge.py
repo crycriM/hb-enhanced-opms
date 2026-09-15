@@ -210,11 +210,12 @@ class GatewayExecBridge:
         expected_active_bin: int,
         max_active_bin_slippage: int,
     ) -> ExecResult:
-        """Legacy compatibility path; not the M4 precise-deposit authority.
+        """Legacy compatibility path; not the M4 weighted-deposit authority.
 
-        Gateway has no precise-bin route, so this collapses the keeper's levels
-        into one canned-strategy price range. It cannot satisfy the exact-bin
-        M4 contract and must not be selected as the production write path."""
+        Gateway exposes only a canned-strategy price range, so this collapses
+        the keeper's target allocation and cannot preserve its explicit per-bin
+        weights or integer zero-bin tolerance. It must not be selected as the
+        production write path."""
         if max_active_bin_slippage < 0:
             return ExecResult(ok=False, error="bad_request")
         # Older Gateway/Meteora SDK paths interpret slippagePct=0 as "unset"

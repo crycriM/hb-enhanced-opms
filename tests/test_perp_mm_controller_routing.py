@@ -116,12 +116,12 @@ class TestExecutionRouting:
         assert c.child_order_quantity == Decimal("1.0")
 
     def test_emergency_routes_to_pa_short_cycle(self, config, md):
-        """emergency above min_size → PA with 10s cycle."""
+        """emergency above min_size → PA with 5s cycle."""
         req = ExecutionRequest(side="sell", amount=5.0, urgency="emergency", reduce_only=True)
         actions = _exec_actions(req, config, md)
         c = actions[0]["config"]
         assert isinstance(c, PassiveAggressiveExecutorConfig)
-        assert c.child_order_time_limit == 10.0
+        assert c.child_order_time_limit == 5.0
         assert c.child_order_refresh_time == 5.0
 
     def test_immediate_routes_to_twap(self, config, md):
@@ -223,7 +223,7 @@ def _exec_actions(req: ExecutionRequest, config, md):
         side=side,
         total_amount_base=Decimal(str(req.amount)),
         child_order_quantity=Decimal(str(req.amount)),
-        child_order_time_limit=10.0,
+        child_order_time_limit=5.0,
         child_order_refresh_time=5.0,
         leverage=config.leverage,
     )

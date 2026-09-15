@@ -147,6 +147,7 @@ class TestFillAccounting:
         # Next tick should close the executor
         await exe._tick()
         assert exe._status == RunnableStatus.TERMINATED
+        assert exe.close_type == CloseType.COMPLETED
 
 
 class TestFailedOrder:
@@ -159,3 +160,33 @@ class TestFailedOrder:
         exe.process_order_failed_event(0, None, failed_evt)
         assert exe._slice_idx == 0  # rewind
         assert exe._current_retries == 1
+
+
+class TestShutdownAndOutcome:
+    async def test_early_stop_does_not_report_completed(self):
+        exe, _ = _make_executor(num_intervals=2, duration_seconds=20.0)
+        await exe._tick()
+        exe.early_stop()
+        await exe.control_task()
+        assert exe._status == RunnableStatus.TERMINATED
+        assert exe.close_type == CloseType.EARLY_STOP
+
+    async def test_under_filled_completion_closes_time_limit(self):
+        exe, _ = _make_executor(num_intervals=2, duration_seconds=20.0)
+        for i in range(2):
+            exe._strategy.current_timestamp = float(i) * 11.0
+            await exe._tick()
+        for tracked in exe._submitted:
+            tracked.is_done = True
+            exe.process_order_completed_event(0, None, _completed_event(tracked.order_id, Decimal("2")))
+        await exe.control_task()
+        assert exe._cumulative_filled < exe.config.total_amount_base
+        assert exe._status == RunnableStatus.TERMINATED
+        assert exe.close_type == CloseType.TIME_LIMIT
+
+    async def test_evaluate_max_retries_closes_failed(self):
+        exe, _ = _make_executor()
+        exe._current_retries = exe._max_retries + 1
+        exe.evaluate_max_retries()
+        assert exe._status == RunnableStatus.TERMINATED
+        assert exe.close_type == CloseType.FAILED

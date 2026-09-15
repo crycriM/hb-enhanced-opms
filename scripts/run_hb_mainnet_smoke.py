@@ -38,7 +38,11 @@ def _resolve_account(account_id: str, use_vault: str | None) -> tuple[str, str, 
     private_key = os.environ.get(f"{prefix}_PRIVATE_KEY")
     if not address or not private_key:
         raise SystemExit(f"Missing {prefix}_ACCOUNT_ADDRESS / _PRIVATE_KEY")
-    master = os.environ.get("HYPERLIQUID_MASTER_ACCOUNT_ADDRESS", "").lower()
+    master = (
+        os.environ.get("HYPERLIQUID_MASTER_ACCOUNT_ADDRESS")
+        or os.environ.get(f"HYPERLIQUID_{MASTER_ID.upper()}_ACCOUNT_ADDRESS")
+        or ""
+    ).lower()
     if use_vault is not None:
         vault = use_vault == "yes"
     elif master:

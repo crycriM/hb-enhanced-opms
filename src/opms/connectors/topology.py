@@ -2,36 +2,25 @@
 Deploy-time topology validation for Hummingbot controller configs.
 
 Mirrors perp_bot.topology.validate_account_topology but adapted to
-PerpMMControllerConfig objects.  HB-free — no hummingbot imports.
+PerpMMControllerConfig objects.  HB-free — no hummingbot imports. Venue capabilities come from perp_bot.
 """
 
 from collections import defaultdict
-from dataclasses import dataclass
 
-
-@dataclass(frozen=True)
-class VenueCapabilities:
-    venue: str
-    position_mode: str           # "net" | "hedge"
-    supports_same_account_hedge: bool
-
-
-_CAPS: dict[str, VenueCapabilities] = {
-    "hyperliquid_perpetual": VenueCapabilities("hyperliquid_perpetual", "net", False),
-    "hyperliquid": VenueCapabilities("hyperliquid", "net", False),
-    "aster_perpetual": VenueCapabilities("aster_perpetual", "hedge", True),
-    "aster": VenueCapabilities("aster", "hedge", True),
-    "lighter_perpetual": VenueCapabilities("lighter_perpetual", "hedge", True),
-    "lighter": VenueCapabilities("lighter", "hedge", True),
-    "mock": VenueCapabilities("mock", "hedge", True),
-}
+from perp_bot.venue_capabilities import VenueCapabilities
+from perp_bot.venue_capabilities import get_venue_capabilities as _venue_capabilities
 
 
 def get_venue_capabilities(connector_name: str) -> VenueCapabilities:
-    key = connector_name.lower()
-    if key not in _CAPS:
-        raise ValueError(f"Unknown connector '{connector_name}' — update topology._CAPS")
-    return _CAPS[key]
+    # One capability table: perp_bot's. This module used to keep its own copy,
+    # which still called Lighter hedge-mode after perp_bot was corrected to net.
+    venue = connector_name.lower().removesuffix("_testnet").removesuffix("_perpetual")
+    try:
+        return _venue_capabilities(venue)
+    except (KeyError, ValueError):
+        raise ValueError(
+            f"Unknown connector '{connector_name}' — add venue '{venue}' to perp_bot.venue_capabilities"
+        ) from None
 
 
 def validate_controller_topology(configs: list) -> list:

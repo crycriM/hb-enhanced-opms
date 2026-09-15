@@ -7,7 +7,9 @@ Execution model (preserved from dex_executor/algorithms/passive_aggressive_v2.py
     - Every ``child_order_refresh_time`` seconds, cancel and re-place at fresh L1.
     - When ``child_order_time_limit`` seconds elapse without a full fill, cancel
       any resting order and fire an aggressive (market) order for the remainder.
-  Once all children are done, the executor closes with CloseType.COMPLETED.
+  Once all children are terminal, the executor closes with an outcome-true
+  CloseType: COMPLETED only when the full total executed, else TIME_LIMIT
+  (or FAILED when retries are exhausted). A skipped child is never COMPLETED.
 
 Key differences from PA-V2:
   - Order placement / cancellation via HB connector (strategy.buy/sell/cancel).
@@ -58,6 +60,9 @@ class PassiveAggressiveExecutorConfig(ExecutorConfigBase):
     child_order_refresh_time: float = 20.0
     # For perp connectors: leverage multiplier applied when computing margin.
     leverage: int = 1
+    # CLOSE makes every child reduce-only on venues that support it, so a
+    # de-risk can shrink a position but never flip it.
+    position_action: PositionAction = PositionAction.OPEN
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +75,10 @@ class _ChildStatus(Enum):
     CANCELING = auto()  # cancel sent; waiting for OrderCancelled event
     AGGRESSIVE = auto() # market order placed after cycle expiry
     DONE = auto()       # child fully filled
+    SKIPPED = auto()    # cycle expired without executing anything
+
+
+_TERMINAL_STATUSES = (_ChildStatus.DONE, _ChildStatus.SKIPPED)
 
 
 @dataclass
@@ -131,7 +140,14 @@ class PassiveAggressiveExecutor(ExecutorBase):
         remainder = q - n * child_q
         slots = [_ChildSlot(target=child_q) for _ in range(n)]
         if remainder > 0:
-            slots.append(_ChildSlot(target=remainder))
+            # Fold the remainder into the last child rather than emitting a
+            # sub-child-size order: venues reject orders under their minimum
+            # notional (HL: $10), and a child sized at the minimum would leave
+            # an unfillable dust child behind.
+            if slots:
+                slots[-1].target += remainder
+            else:
+                slots.append(_ChildSlot(target=remainder))
         return slots
 
     # ------------------------------------------------------------------
@@ -150,6 +166,7 @@ class PassiveAggressiveExecutor(ExecutorBase):
                 amount=self.config.total_amount_base,
                 price=mid,
                 leverage=Decimal(self.config.leverage),
+                position_close=self.config.position_action == PositionAction.CLOSE,
             )
         else:
             candidate = OrderCandidate(
@@ -171,21 +188,23 @@ class PassiveAggressiveExecutor(ExecutorBase):
             self._step()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             self._cancel_all_open()
-            self.close_execution_by(CloseType.COMPLETED)
+            # early_stop() already chose EARLY_STOP / POSITION_HOLD; an
+            # interrupted execution must not report itself as COMPLETED.
+            self.close_execution_by(self.close_type or self._final_close_type())
 
     # ------------------------------------------------------------------
     # Main state machine
     # ------------------------------------------------------------------
 
     def _step(self):
-        # Advance child index past done slots.
+        # Advance child index past terminal slots.
         while self._child_idx < len(self._children) and \
-                self._children[self._child_idx].status == _ChildStatus.DONE:
+                self._children[self._child_idx].status in _TERMINAL_STATUSES:
             self._child_idx += 1
 
         if self._child_idx >= len(self._children):
-            # All children done.
-            self.close_execution_by(CloseType.COMPLETED)
+            # All children terminal; only a fully executed run is COMPLETED.
+            self.close_execution_by(self._final_close_type())
             return
 
         child = self._children[self._child_idx]
@@ -204,7 +223,7 @@ class PassiveAggressiveExecutor(ExecutorBase):
                     f"PA child {self._child_idx}: cycle expired in IDLE — skipping "
                     f"(filled {child.filled}/{child.target})"
                 )
-                child.status = _ChildStatus.DONE
+                child.status = _ChildStatus.SKIPPED
             else:
                 self._place_limit(child)
 
@@ -238,7 +257,7 @@ class PassiveAggressiveExecutor(ExecutorBase):
             side=self.config.side,
             amount=remaining,
             price=price,
-            position_action=PositionAction.OPEN,
+            position_action=self.config.position_action,
         )
         child.tracked_order = TrackedOrder(order_id=order_id)
         child.status = _ChildStatus.ACTIVE
@@ -260,7 +279,7 @@ class PassiveAggressiveExecutor(ExecutorBase):
             order_type=OrderType.MARKET,
             side=self.config.side,
             amount=remaining,
-            position_action=PositionAction.OPEN,
+            position_action=self.config.position_action,
         )
         child.tracked_order = TrackedOrder(order_id=order_id)
         child.status = _ChildStatus.AGGRESSIVE
@@ -296,6 +315,21 @@ class PassiveAggressiveExecutor(ExecutorBase):
         self.close_timestamp = self._strategy.current_timestamp
         self._status = RunnableStatus.TERMINATED
         self.stop()
+
+    def _final_close_type(self) -> CloseType:
+        """Close type must describe what happened, not merely that the run ended."""
+        if self._current_retries > self._max_retries:
+            return CloseType.FAILED
+        if self._cumulative_filled >= self.config.total_amount_base:
+            return CloseType.COMPLETED
+        logger.warning(
+            f"PA: closing under-filled ({self._cumulative_filled}/{self.config.total_amount_base}) — TIME_LIMIT"
+        )
+        return CloseType.TIME_LIMIT
+
+    def evaluate_max_retries(self) -> None:
+        if self._current_retries > self._max_retries:
+            self.close_execution_by(CloseType.FAILED)
 
     # ------------------------------------------------------------------
     # HB event callbacks (synchronous, called on HB event thread)
@@ -382,13 +416,20 @@ class PassiveAggressiveExecutor(ExecutorBase):
         if not self._is_our_order(event.order_id):
             return
         child = self._active_child()
-        child.status = _ChildStatus.IDLE  # retry on next tick
+        was_aggressive = child.status == _ChildStatus.AGGRESSIVE
+        child.status = _ChildStatus.IDLE
         child.tracked_order = None
         self._current_retries += 1
         logger.warning(
             f"PA child {self._child_idx}: order failed [{event.order_id}], "
             f"retry {self._current_retries}/{self._max_retries}"
         )
+        if (was_aggressive and self._status == RunnableStatus.RUNNING
+                and self._current_retries <= self._max_retries):
+            # A rejected market order must not become a silent skip; retry it
+            # until evaluate_max_retries() closes the executor as FAILED.
+            # Never after a stop — that would place an order post-termination.
+            self._place_aggressive(child)
 
     # ------------------------------------------------------------------
     # ExecutorBase required properties

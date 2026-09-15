@@ -35,10 +35,16 @@ class RunnableStatus(Enum):
 
 
 class CloseType(Enum):
-    COMPLETED = auto()
+    # Mirrors hummingbot.strategy_v2.models.executors.CloseType (same order).
+    TIME_LIMIT = auto()
+    STOP_LOSS = auto()
+    TAKE_PROFIT = auto()
+    EXPIRED = auto()
     EARLY_STOP = auto()
-    FAILED = auto()
+    TRAILING_STOP = auto()
     INSUFFICIENT_BALANCE = auto()
+    FAILED = auto()
+    COMPLETED = auto()
     POSITION_HOLD = auto()
 
 
@@ -118,6 +124,11 @@ class ExecutorBase:
 
     def start(self): pass
     def stop(self): pass
+
+    def evaluate_max_retries(self):
+        if self._current_retries > self._max_retries:
+            self.close_type = CloseType.FAILED
+            self.stop()
 
     @property
     def status(self): return self._status
