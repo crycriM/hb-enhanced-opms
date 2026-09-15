@@ -120,6 +120,25 @@ async def _wait_for(predicate, timeout_s: float, interval: float = 1.0) -> bool:
     return predicate()
 
 
+async def _sleep_with_order_poll(seconds: float, info, address: str, coin: str,
+                                 order_log: list[dict] | None, poll_s: float = 1.0) -> None:
+    """Sleep in slices, recording venue reduce-only orders on each slice.
+
+    The pump cadence alone (~9.4 s: 5 s sleep + HL REST latency) missed a
+    reduce-only order that rested less than 8 s before filling (2026-09-15),
+    so the gate's "did it ever rest" check must not depend on it."""
+    if order_log is None:
+        await asyncio.sleep(seconds)
+        return
+    remaining = seconds
+    while remaining > 0:
+        for order in _reduce_only_orders(info, address, coin):
+            order_log.append({"ts": round(time.time(), 1), **order})
+        slice_s = min(poll_s, remaining)
+        await asyncio.sleep(slice_s)
+        remaining -= slice_s
+
+
 async def _open_position(controller, strategy, executors, size: Decimal, info, address, coin, timeout_s):
     """MARKET buy through a real OrderExecutor; returns the open-phase evidence."""
     from hummingbot.core.data_type.common import PositionAction, TradeType
@@ -152,7 +171,8 @@ async def _open_position(controller, strategy, executors, size: Decimal, info, a
     }
 
 
-async def _run_cycles(controller, strategy, executors, info, address, coin, *, seconds, cycle_s, samples):
+async def _run_cycles(controller, strategy, executors, info, address, coin, *, seconds, cycle_s, samples,
+                      order_log: list[dict] | None = None, poll_s: float = 1.0):
     """Drive the controller like ControllerBase.control_task does
     (update_processed_data -> determine_executor_actions -> execute), until the
     venue position is flat. Quote creates are dropped, not executed."""
@@ -195,7 +215,7 @@ async def _run_cycles(controller, strategy, executors, info, address, coin, *, s
         })
         if abs(position) < SIZE_EPS:
             return created, suppressed_quotes, True
-        await asyncio.sleep(cycle_s)
+        await _sleep_with_order_poll(cycle_s, info, address, coin, order_log, poll_s)
     return created, suppressed_quotes, abs(_venue_position(info, address, coin)) < SIZE_EPS
 
 
@@ -362,20 +382,25 @@ async def main() -> int:
         fills_before = controller._fill_observer.n_fills
         orders_before = len(strategy.orders)
         samples: list = []
+        order_log: list = []
         started = time.time()
         created, suppressed, flat = await _run_cycles(
             controller, strategy, executors, info, address, coin,
             seconds=args.derisk_timeout, cycle_s=args.cycle_s, samples=samples,
+            order_log=order_log,
         )
         await _wait_for(lambda: all(e.is_closed for e in created), 15.0)
         pa = [e for e in created if e.config.type == "passive_aggressive_executor"]
-        resting_oids = {o["oid"] for s in samples for o in s["reduce_only_resting"]}
+        resting_oids = {o["oid"] for s in samples for o in s["reduce_only_resting"]} | {
+            o["oid"] for o in order_log
+        }
         phase = {
             "phase": "de_risk", "flat": flat, "seconds": round(time.time() - started, 1),
             "executors": _pa_summary(created), "suppressed_quote_creates": suppressed,
             "orders": strategy.orders[orders_before:], "distinct_reduce_only_oids": sorted(resting_oids),
             "fills": controller._fill_observer.n_fills - fills_before,
-            "order_failures": sum(e._current_retries for e in created), "samples": samples,
+            "order_failures": sum(e._current_retries for e in created),
+            "samples": samples, "venue_order_poll": order_log,
         }
         report["phases"].append(phase)
         print(f"de-risk: flat={flat} in {phase['seconds']}s, executors={[(x['type'], x['close_type']) for x in phase['executors']]}, "
@@ -421,6 +446,7 @@ async def main() -> int:
             created, suppressed, flat = await _run_cycles(
                 controller, strategy, executors, info, address, coin,
                 seconds=args.emergency_deadline * 2, cycle_s=args.cycle_s, samples=samples,
+                order_log=order_log,
             )
             elapsed = round(time.time() - started, 1)
             await _wait_for(lambda: all(e.is_closed for e in created), 15.0)
