@@ -21,6 +21,7 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 from mm_core.inventory import Caps
+from mm_core.risk_policy import RiskConfig
 
 from perp_bot.config import PerpPairConfig
 from perp_bot.keeper import Keeper
@@ -85,6 +86,11 @@ class PerpMMControllerConfig(ControllerConfigBase):
     # this every controller runs at ControllerBase's 1 s default — and quotes
     # are cancel/replaced every cycle.
     update_interval: float = 5.0
+    # Margin-health stop thresholds (see mm_core.risk_policy.RiskConfig):
+    # ratio of available-after-maintenance to equity. Only used when the
+    # connector can supply the margin figure.
+    margin_health_soft: float = 0.20
+    margin_health_hard: float = 0.10
 
     @property
     def coin(self) -> str:
@@ -108,6 +114,10 @@ class PerpMMController(ControllerBase):
             exchange=config.venue,
             account_id=config.account_id,
             caps=Caps(max_position=config.max_position, critical_position=config.critical_position),
+            risk=RiskConfig(
+                margin_health_soft=config.margin_health_soft,
+                margin_health_hard=config.margin_health_hard,
+            ),
         )
         self._client = InProcessClient()
         if config.decision_log_path:
@@ -158,6 +168,7 @@ class PerpMMController(ControllerBase):
                 coin=self.config.coin,
                 position=float(self._current_base_position()),
                 equity=float(self._current_equity()),
+                margin_available=await self._current_margin_available(),
             )
         })
 
@@ -181,6 +192,35 @@ class PerpMMController(ControllerBase):
              if p.trading_pair == self.config.trading_pair),
             Decimal("0"),
         )
+
+    async def _current_margin_available(self) -> float | None:
+        """Venue-computed liquidation distance for the margin-health stop.
+
+        On HL unified accounts this is spotClearinghouseState
+        .tokenToAvailableAfterMaintenance (token index 0 = USDC) = spot
+        total − cross maintenance margin used, read through the connector's
+        own rate-limited REST machinery. Any failure — or a connector that
+        doesn't expose the read — returns None, leaving the margin-health
+        stop dormant rather than blocking the control loop."""
+        connector = self.market_data_provider.get_connector(self.config.connector_name)
+        try:
+            from hummingbot.connector.derivative.hyperliquid_perpetual import (
+                hyperliquid_perpetual_constants as hl_constants,
+            )
+            spot = await connector._api_post(
+                path_url=hl_constants.ACCOUNT_INFO_URL,
+                data={
+                    "type": hl_constants.SPOT_USER_STATE_TYPE,
+                    "user": connector.hyperliquid_perpetual_address,
+                },
+            )
+            avail = {
+                int(token): value
+                for token, value in spot.get("tokenToAvailableAfterMaintenance", [])
+            }
+            return float(avail.get(0, 0))
+        except Exception:
+            return None
 
     def _current_equity(self) -> Decimal:
         # Cross-margined account value (collateral + unrealized PnL), resolved

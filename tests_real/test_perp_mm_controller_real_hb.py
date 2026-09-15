@@ -382,3 +382,74 @@ def test_shadow_mode_decides_but_emits_no_executor_actions():
     assert ctrl.keeper.shadow_mode is True
     ctrl._client.last_intent = _de_risk_intent("emergency")  # even an emergency
     assert ctrl.determine_executor_actions() == []
+
+
+# --- margin-health feed (2026-09-15) ------------------------------------------
+# RiskPolicy gained a margin-health stop (margin_health_soft/hard ratios of
+# available-after-maintenance to equity). These lock the controller's feed:
+# HL unified accounts publish it as spotClearinghouseState
+# .tokenToAvailableAfterMaintenance, via the connector's own REST machinery.
+
+
+class _ConnectorWithSpotState:
+    """Minimal HyperliquidPerpetualDerivative surface for the spot-state read."""
+
+    def __init__(self, spot_state):
+        self.hyperliquid_perpetual_address = "0xsubaccount"
+        self._spot_state = spot_state
+        self.account_positions = {}
+
+    async def _api_post(self, path_url, data=None):
+        assert path_url == "/info"
+        assert data["type"] == "spotClearinghouseState"
+        assert data["user"] == "0xsubaccount"
+        if isinstance(self._spot_state, Exception):
+            raise self._spot_state
+        return self._spot_state
+
+    def get_all_balances(self):
+        return {"USD": Decimal("300")}
+
+
+class _MarketDataWithSpot(_MarketData):
+    def __init__(self, connector, **kwargs):
+        super().__init__(**kwargs)
+        self._spot_connector = connector
+
+    def get_connector(self, connector_name):
+        return self._spot_connector
+
+
+def _spot_state(avail="271.4"):
+    return {"tokenToAvailableAfterMaintenance": [[0, avail], [1, "0"]]}
+
+
+async def test_current_margin_available_reads_spot_clearinghouse():
+    import asyncio
+
+    ctrl = _controller(_MarketDataWithSpot(_ConnectorWithSpotState(_spot_state())))
+    assert await asyncio.wait_for(ctrl._current_margin_available(), 5) == pytest.approx(271.4)
+
+
+async def test_current_margin_available_none_when_read_fails():
+    import asyncio
+
+    ctrl = _controller(_MarketDataWithSpot(_ConnectorWithSpotState(RuntimeError("info down"))))
+    assert await asyncio.wait_for(ctrl._current_margin_available(), 5) is None
+
+
+async def test_current_margin_available_none_on_unsupported_connector():
+    import asyncio
+
+    ctrl = _controller(_MarketData())  # plain connector: no _api_post
+    assert await asyncio.wait_for(ctrl._current_margin_available(), 5) is None
+
+
+async def test_update_processed_data_feeds_margin_available_to_keeper():
+    import asyncio
+
+    ctrl = PerpMMController(
+        _config(), _MarketDataWithSpot(_ConnectorWithSpotState(_spot_state())), asyncio.Queue()
+    )
+    await asyncio.wait_for(ctrl.update_processed_data(), 10)
+    assert ctrl.keeper._margin_available == pytest.approx(271.4)

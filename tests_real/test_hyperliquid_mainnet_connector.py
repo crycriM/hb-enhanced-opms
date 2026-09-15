@@ -73,6 +73,38 @@ async def test_subaccount_connector_reads_unified_balance():
         assert connector._use_vault is True
         balances = await _read_balance(connector)
         assert balances.get("USD", 0) > 0, f"expected a funded unified balance, got {balances}"
+        # Margin-health feed (mm_core RiskConfig.margin_health_*): read the
+        # live spotClearinghouseState.tokenToAvailableAfterMaintenance through
+        # the controller's method, on the same connector/loop — a second
+        # connector in a later test would hit HB's shared rate-limiter state
+        # from this loop ("Event loop is closed"). The figure is the balance
+        # minus cross maintenance margin used, so on a healthy account it
+        # can only sit in (0, balance].
+        from opms.controllers.generic.perp_mm_controller import (
+            PerpMMController,
+            PerpMMControllerConfig,
+        )
+
+        ctrl = object.__new__(PerpMMController)
+        ctrl.config = PerpMMControllerConfig(
+            id="ctrl_margin_live",
+            controller_name="perp_mm",
+            connector_name="hyperliquid_perpetual",
+            trading_pair="ETH-USD",
+            venue="hyperliquid",
+            account_id=SUBACCOUNT_ID,
+        )
+
+        class _MD:
+            def get_connector(self, connector_name):
+                return connector
+
+        ctrl.market_data_provider = _MD()
+
+        margin = await ctrl._current_margin_available()
+        equity = float(balances.get("USD", 0))
+        assert margin is not None, "spot clearinghouse read failed on a live funded account"
+        assert 0 < margin <= equity, f"margin {margin} outside (0, {equity}]"
     finally:
         await connector.stop_network()
 
