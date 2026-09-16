@@ -431,18 +431,33 @@ async def test_current_margin_available_reads_spot_clearinghouse():
     assert await asyncio.wait_for(ctrl._current_margin_available(), 5) == pytest.approx(271.4)
 
 
-async def test_current_margin_available_none_when_read_fails():
+async def test_current_margin_available_fails_closed_when_read_fails(caplog):
     import asyncio
 
     ctrl = _controller(_MarketDataWithSpot(_ConnectorWithSpotState(RuntimeError("info down"))))
-    assert await asyncio.wait_for(ctrl._current_margin_available(), 5) is None
+    assert await asyncio.wait_for(ctrl._current_margin_available(), 5) == 0.0
+    assert "failing closed" in caplog.text
 
 
-async def test_current_margin_available_none_on_unsupported_connector():
+async def test_current_margin_available_fails_closed_on_unsupported_connector(caplog):
     import asyncio
 
     ctrl = _controller(_MarketData())  # plain connector: no _api_post
-    assert await asyncio.wait_for(ctrl._current_margin_available(), 5) is None
+    assert await asyncio.wait_for(ctrl._current_margin_available(), 5) == 0.0
+    assert "failing closed" in caplog.text
+
+
+async def test_update_processed_data_emergency_exits_when_margin_read_fails():
+    import asyncio
+
+    connector = _ConnectorWithSpotState(RuntimeError("info down"))
+    ctrl = PerpMMController(_config(), _MarketDataWithSpot(connector), asyncio.Queue())
+
+    await asyncio.wait_for(ctrl.update_processed_data(), 10)
+
+    assert ctrl._client.last_intent is not None
+    assert ctrl._client.last_intent.urgency == "emergency"
+    assert ctrl._client.last_intent.target_inventory == 0.0
 
 
 async def test_update_processed_data_feeds_margin_available_to_keeper():
