@@ -43,6 +43,12 @@ OPMS is the execution layer of the [amm-solution](https://github.com/amm-solutio
 | `perp_mm_controller` | Hummingbot `ControllerBase` integration. The **only** module with `import hummingbot`. Drives Keeper via `InProcessClient` and translates `ExecIntent` → HB `ExecutorAction`. |
 | `perp_mm_bridge` | HB-free bridge. `InProcessClient` duck-types `OpmsClient` for in-process Keeper communication. `intent_to_order_specs()` maps keeper decisions to venue-agnostic order specs. |
 
+The perp controller uses `perp_bot`'s shared fail-closed margin-health
+invariant. A failed, missing, malformed, or non-finite
+`tokenToAvailableAfterMaintenance` reading is logged at critical severity and
+fed to the keeper as zero available margin, forcing an emergency-exit decision
+instead of silently disabling the stop.
+
 ### `opms.executors`
 
 | Module | Purpose |

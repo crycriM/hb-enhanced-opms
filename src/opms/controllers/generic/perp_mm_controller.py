@@ -25,6 +25,7 @@ from mm_core.risk_policy import RiskConfig
 
 from perp_bot.config import PerpPairConfig
 from perp_bot.keeper import Keeper
+from perp_bot.margin_health import fail_closed_margin_available
 from perp_bot.opms_client import Position
 
 from opms.analytics.fill_observer import FillObserver
@@ -193,15 +194,15 @@ class PerpMMController(ControllerBase):
             Decimal("0"),
         )
 
-    async def _current_margin_available(self) -> float | None:
+    async def _current_margin_available(self) -> float:
         """Venue-computed liquidation distance for the margin-health stop.
 
         On HL unified accounts this is spotClearinghouseState
         .tokenToAvailableAfterMaintenance (token index 0 = USDC) = spot
         total − cross maintenance margin used, read through the connector's
-        own rate-limited REST machinery. Any failure — or a connector that
-        doesn't expose the read — returns None, leaving the margin-health
-        stop dormant rather than blocking the control loop."""
+        own rate-limited REST machinery. Invalid data and read failures use
+        the keeper's shared fail-closed invariant: log critically and return
+        zero, which the risk policy treats as an emergency-exit breach."""
         connector = self.market_data_provider.get_connector(self.config.connector_name)
         try:
             from hummingbot.connector.derivative.hyperliquid_perpetual import (
@@ -218,9 +219,18 @@ class PerpMMController(ControllerBase):
                 int(token): value
                 for token, value in spot.get("tokenToAvailableAfterMaintenance", [])
             }
-            return float(avail.get(0, 0))
-        except Exception:
-            return None
+            return fail_closed_margin_available(
+                avail.get(0),
+                source=f"{self.config.connector_name} spot clearinghouse state",
+            )
+        except Exception as exc:
+            return fail_closed_margin_available(
+                None,
+                source=(
+                    f"{self.config.connector_name} spot clearinghouse read failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
 
     def _current_equity(self) -> Decimal:
         # Cross-margined account value (collateral + unrealized PnL), resolved

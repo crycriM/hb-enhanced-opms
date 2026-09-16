@@ -65,7 +65,12 @@ def make_config():
 @pytest.mark.asyncio
 async def test_bridge_matches_oracle_keeper(tmp_path):
     ticks = snapshots(n=15, drift=25.0)
-    position = Position(coin="BTC", position=0.0, equity=1000.0)
+    position = Position(
+        coin="BTC",
+        position=0.0,
+        equity=1000.0,
+        margin_available=1000.0,
+    )
 
     oracle_log = tmp_path / "oracle.jsonl"
     oracle_client = _StaticPositionClient(position)
