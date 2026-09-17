@@ -205,6 +205,14 @@ The **Hummingbot Gateway** is a separate HTTP service (default
 only comes into play for DEX venues (Meteora / DLMM), which is exactly the
 "future DEX support" case.
 
+> **Execution routing note:** hb-opms is the **only route for orders on perp
+> DEX**. However, liquidity provision on Meteora with a precise bin profile is
+> **not yet available via the HB Gateway** — those operations go through the
+> sibling project [`solana-clmm-executor`](../solana-clmm-executor/)
+> (JSON-lines signing boundary for Meteora DLMM deposits/withdrawals/refresh
+> workflows). Until the Gateway can express exact bin ladders, Meteora LP
+> execution depends on `solana-clmm-executor`; perp order routing does not.
+
 - The Gateway **ships with Hummingbot** — there is nothing separate to
   `pip install`. In the Docker deployment it runs alongside the HB container;
   the `GatewayExecBridge` (the *only* code that talks to it) runs as an ordinary
