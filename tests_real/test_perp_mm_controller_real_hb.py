@@ -142,18 +142,19 @@ def test_execution_actions_map_to_real_executors(urgency):
         f"no HB executor registered for type={cfg.type!r}"
 
 
-def test_immediate_routes_to_real_twap_config():
-    from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig, TWAPMode
+def test_immediate_routes_to_bounded_reduce_only_pa_config():
+    from hummingbot.core.data_type.common import PositionAction
 
     ctrl = _controller()
     actions = ctrl._execution_actions(
         ExecutionRequest(side="sell", amount=0.5, urgency="immediate", reduce_only=True)
     )
     cfg = actions[0].executor_config
-    assert isinstance(cfg, TWAPExecutorConfig)
-    assert cfg.mode == TWAPMode.TAKER
-    assert cfg.total_duration == 120
-    assert cfg.total_amount_quote == Decimal("0.5") * Decimal("3000")
+    assert isinstance(cfg, PassiveAggressiveExecutorConfig)
+    assert cfg.position_action == PositionAction.CLOSE
+    assert cfg.total_amount_base == Decimal("0.5")
+    assert cfg.child_order_quantity == Decimal("0.5")
+    assert cfg.child_order_time_limit == pytest.approx(ctrl.config.quote_stop_time_limit)
 
 
 def test_emergency_below_min_size_uses_market_order_executor():
@@ -172,15 +173,16 @@ def test_emergency_below_min_size_uses_market_order_executor():
 def test_quoting_intent_maps_to_limit_maker_order_executor():
     from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy
     from hummingbot.strategy_v2.executors.order_executor.data_types import OrderExecutorConfig
+    from hummingbot.core.data_type.common import PositionAction, TradeType
 
     ctrl = _controller()
     ctrl._client.last_intent = ExecIntent(
         venue="hyperliquid",
         coin="ETH",
         account_id="e2_mm1",
-        target_inventory=0.0,
-        current_inventory=0.0,
-        quote=QuoteSpec(bid_price=2999.0, ask_price=3001.0, bid_size=0.01, ask_size=0.01),
+        target_inventory=0.4,
+        current_inventory=0.0769,
+        quote=QuoteSpec(bid_price=2999.0, ask_price=3001.0, bid_size=0.01, ask_size=0.0769),
         urgency="passive",
     )
     actions = ctrl.determine_executor_actions()
@@ -191,6 +193,9 @@ def test_quoting_intent_maps_to_limit_maker_order_executor():
         cfg = action.executor_config
         assert isinstance(cfg, OrderExecutorConfig)
         assert cfg.execution_strategy == ExecutionStrategy.LIMIT_MAKER
+    by_side = {a.executor_config.side: a.executor_config for a in actions}
+    assert by_side[TradeType.BUY].position_action == PositionAction.OPEN
+    assert by_side[TradeType.SELL].position_action == PositionAction.CLOSE
 
 
 class _ConnectorWithBalance:
@@ -270,9 +275,10 @@ def test_emergency_pa_is_reduce_only():
 
 
 class _ExecInfo:
-    def __init__(self, id, config):
+    def __init__(self, id, config, custom_info=None):
         self.id = id
         self.config = config
+        self.custom_info = custom_info or {}
 
 
 def _de_risk_intent(urgency: str):
@@ -314,10 +320,23 @@ def test_escalation_to_emergency_replaces_running_de_risk():
     assert actions[1].executor_config.child_order_time_limit == 5.0
 
 
-def test_quote_refresh_still_replaces_every_quote_executor():
-    from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+def test_quote_refresh_cancels_before_creating_replacements():
+    from hummingbot.strategy_v2.models.executor_actions import (
+        CreateExecutorAction,
+        StopExecutorAction,
+    )
 
-    ctrl = _controller()
+    class _ClockedMarketData(_MarketData):
+        def __init__(self):
+            super().__init__()
+            self.now = 100.0
+
+        def time(self):
+            return self.now
+
+    md = _ClockedMarketData()
+    ctrl = _controller(md)
+    ctrl.config = _config(quote_refresh_interval=5.0)
     ctrl._client.last_intent = ExecIntent(
         venue="hyperliquid", coin="ETH", account_id="e2_mm1",
         target_inventory=0.0, current_inventory=0.0,
@@ -325,10 +344,115 @@ def test_quote_refresh_still_replaces_every_quote_executor():
         urgency="passive",
     )
     old = ctrl.determine_executor_actions()
-    _with_active(ctrl, [_ExecInfo(f"q-{i}", a.executor_config) for i, a in enumerate(old)])
+    _with_active(ctrl, [
+        _ExecInfo(f"q-{i}", action.executor_config, {"order_id": f"oid-{i}"})
+        for i, action in enumerate(old)
+    ])
+    assert ctrl.determine_executor_actions() == []
+    md.now += 5.0
     actions = ctrl.determine_executor_actions()
     assert sum(isinstance(a, StopExecutorAction) for a in actions) == 2
-    assert len(actions) == 4
+    assert not any(isinstance(a, CreateExecutorAction) for a in actions)
+
+    # A slow cancel acknowledgement is part of the planned two-phase refresh,
+    # not missing-quote evidence. It must not trigger the flatten watchdog.
+    md.now += 30.0
+    still_stopping = ctrl.determine_executor_actions()
+    assert sum(isinstance(a, StopExecutorAction) for a in still_stopping) == 2
+    assert not any(isinstance(a, CreateExecutorAction) for a in still_stopping)
+
+    _with_active(ctrl, [])
+    replacements = ctrl.determine_executor_actions()
+    assert len(replacements) == 2
+    assert all(isinstance(a, CreateExecutorAction) for a in replacements)
+
+
+def test_stale_quote_liveness_trips_to_reduce_only_flatten():
+    from hummingbot.core.data_type.common import TradeType
+    from hummingbot.strategy_v2.models.executor_actions import (
+        CreateExecutorAction,
+        StopExecutorAction,
+    )
+
+    class _ClockedMarketData(_MarketData):
+        def __init__(self):
+            super().__init__()
+            self.now = 100.0
+
+        def time(self):
+            return self.now
+
+    md = _ClockedMarketData()
+    ctrl = _controller(md)
+    ctrl.config = _config(quote_liveness_timeout=10.0, quote_recovery_cooldown=30.0)
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", account_id="e2_mm1",
+        target_inventory=0.4, current_inventory=0.0769,
+        quote=QuoteSpec(bid_price=2999.0, ask_price=3001.0,
+                        bid_size=0.01, ask_size=0.0769),
+        urgency="passive",
+    )
+    quote_actions = ctrl.determine_executor_actions()
+    stuck = [
+        _ExecInfo(f"q-{i}", action.executor_config, {"order_id": None})
+        for i, action in enumerate(quote_actions)
+    ]
+    _with_active(ctrl, stuck)
+
+    # Missing exchange order ids are tolerated for one grace window. Keep the
+    # same executors alive long enough to obtain an exchange id; recreating
+    # them every controller tick would prevent liveness from ever recovering.
+    grace_actions = ctrl.determine_executor_actions()
+    assert grace_actions == []
+    md.now += 10.0
+    actions = ctrl.determine_executor_actions()
+
+    assert sum(isinstance(a, StopExecutorAction) for a in actions) == 2
+    assert not any(isinstance(a, CreateExecutorAction) for a in actions)
+
+    _with_active(ctrl, [])
+    creates = [
+        a for a in ctrl.determine_executor_actions()
+        if isinstance(a, CreateExecutorAction)
+    ]
+    assert len(creates) == 1
+    assert isinstance(creates[0].executor_config, PassiveAggressiveExecutorConfig)
+    assert creates[0].executor_config.side == TradeType.SELL
+    assert creates[0].executor_config.total_amount_base == Decimal("0.0769")
+    assert ctrl._quote_liveness.snapshot(md.now)["state"] == "open"
+
+
+def test_quote_stop_waits_for_cancel_confirmation_before_flattening():
+    from hummingbot.strategy_v2.models.executor_actions import (
+        CreateExecutorAction,
+        StopExecutorAction,
+    )
+
+    ctrl = _controller()
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", account_id="e2_mm1",
+        target_inventory=0.4, current_inventory=0.0769,
+        quote=QuoteSpec(bid_price=2999.0, ask_price=3001.0,
+                        bid_size=0.01, ask_size=0.0769),
+        urgency="passive",
+    )
+    quote_actions = ctrl.determine_executor_actions()
+    quotes = [
+        _ExecInfo(f"q-{i}", action.executor_config, {"order_id": f"oid-{i}"})
+        for i, action in enumerate(quote_actions)
+    ]
+    _with_active(ctrl, quotes)
+    ctrl._client.last_intent = _de_risk_intent("immediate")
+
+    cancel_phase = ctrl.determine_executor_actions()
+    assert sum(isinstance(a, StopExecutorAction) for a in cancel_phase) == 2
+    assert not any(isinstance(a, CreateExecutorAction) for a in cancel_phase)
+
+    _with_active(ctrl, [])
+    close_phase = ctrl.determine_executor_actions()
+    assert len(close_phase) == 1
+    assert isinstance(close_phase[0], CreateExecutorAction)
+    assert isinstance(close_phase[0].executor_config, PassiveAggressiveExecutorConfig)
 
 
 def test_positions_refresh_once_after_a_traded_executor_finishes():
@@ -375,6 +499,16 @@ def _hb_constructed(**overrides):
 def test_hb_add_controller_path_uses_configured_cycle_not_1s_default():
     assert _hb_constructed().update_interval == 5.0
     assert _hb_constructed(update_interval=10.0).update_interval == 10.0
+
+
+def test_controller_passes_structural_tilt_to_keeper():
+    ctrl = _hb_constructed(target_inventory=Decimal("0.4"))
+    assert ctrl.keeper.config.target_inventory == pytest.approx(0.4)
+
+
+def test_controller_passes_leverage_to_keeper():
+    ctrl = _hb_constructed(leverage=6)
+    assert ctrl.keeper.config.leverage == 6
 
 
 def test_shadow_mode_decides_but_emits_no_executor_actions():
@@ -468,3 +602,148 @@ async def test_update_processed_data_feeds_margin_available_to_keeper():
     )
     await asyncio.wait_for(ctrl.update_processed_data(), 10)
     assert ctrl.keeper._margin_available == pytest.approx(271.4)
+
+
+# --- code-review 2026-09-16 fixes ---------------------------------------------
+
+
+def test_min_child_quantity_and_passive_de_risk_survive_nan_mid():
+    """Review #1: HB's NaN mid sentinel is truthy, so the old `not mid` guard
+    let it reach `min(amount, max(amount/5, NaN))` and crash the de-risk path
+    every tick on a thin/disconnected book."""
+    ctrl = _controller(_MarketData(mid="NaN"))
+    assert ctrl._min_child_quantity() == Decimal("0")
+    cfg = ctrl._execution_actions(
+        ExecutionRequest(side="sell", amount=0.01, urgency="normal", reduce_only=True)
+    )[0].executor_config
+    assert cfg.child_order_quantity == Decimal("0.002")  # amount/5, no NaN
+
+
+def test_base_position_filters_to_own_side_in_hedge_mode():
+    """Review #3: topology permits sibling controllers on a hedge-mode
+    (coin, account); summing every leg feeds a sibling's opposite-side
+    position into this controller's signed exposure."""
+    ctrl = _controller(_MarketData(positions=[_position("3"), _position("-2")]))
+    ctrl.config = _config(position_side="long")
+    assert ctrl._current_base_position() == Decimal("3")
+
+
+def test_base_position_nets_all_legs_when_side_unset():
+    """Net-mode / single-controller default is unchanged: sum every leg."""
+    ctrl = _controller(_MarketData(positions=[_position("3"), _position("-2")]))
+    assert ctrl._current_base_position() == Decimal("1")
+
+
+def test_growing_de_risk_need_tops_up_instead_of_being_dropped():
+    """Review #4: dedup keyed only on (type, side, time_limit) silently drops a
+    larger follow-up de-risk on an already-running executor."""
+    from hummingbot.strategy_v2.models.executor_actions import (
+        CreateExecutorAction,
+        StopExecutorAction,
+    )
+
+    ctrl = _controller()
+    running = ctrl._execution_actions(
+        ExecutionRequest(side="sell", amount=0.5, urgency="normal", reduce_only=True)
+    )[0].executor_config
+    _with_active(ctrl, [_ExecInfo("pa-1", running)])
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", account_id="e2_mm1",
+        target_inventory=0.0, current_inventory=1.0, quote=None, urgency="normal",
+    )
+    actions = ctrl.determine_executor_actions()
+    assert [type(a) for a in actions] == [StopExecutorAction, CreateExecutorAction]
+    assert actions[1].executor_config.total_amount_base == Decimal("1.0")
+
+
+def test_settled_executor_ids_pruned_to_current_executors():
+    """Review #5: the settled-id set must not grow unbounded for the life of
+    the process — ids that have aged out of executors_info are dropped."""
+    import asyncio
+    from types import SimpleNamespace
+
+    class _Conn:
+        async def _update_positions(self):
+            pass
+
+    class _MD(_MarketData):
+        def get_connector(self, connector_name):
+            return _Conn()
+
+    ctrl = _controller(_MD())
+    ctrl._settled_executor_ids = {"old-1", "old-2", "pa-1"}
+    ctrl.executors_info = [SimpleNamespace(id="pa-1", is_done=True,
+                                           filled_amount_quote=Decimal("29.7"))]
+    asyncio.run(ctrl._refresh_positions_after_fills())
+    assert ctrl._settled_executor_ids == {"pa-1"}
+
+
+def test_margin_available_is_cached_within_ttl():
+    """Review #2: the spot-clearinghouse read is a fresh uncached REST call
+    every control cycle, duplicating the connector's own balance polling and
+    inviting the rate limits that make the stop misbehave."""
+    import asyncio
+
+    calls: list[int] = []
+
+    class _CountingConnector(_ConnectorWithSpotState):
+        async def _api_post(self, path_url, data=None):
+            calls.append(1)
+            return await super()._api_post(path_url, data)
+
+    ctrl = _controller(_MarketDataWithSpot(_CountingConnector(_spot_state())))
+    assert asyncio.run(ctrl._current_margin_available()) == pytest.approx(271.4)
+    assert asyncio.run(ctrl._current_margin_available()) == pytest.approx(271.4)
+    assert len(calls) == 1  # second read served from cache within TTL
+
+
+def test_margin_cache_does_not_serve_a_failed_read():
+    """A fail-closed 0.0 is never cached, but retry backoff prevents a hot loop."""
+    import asyncio
+
+    calls: list[int] = []
+
+    class _FlakyConnector(_ConnectorWithSpotState):
+        async def _api_post(self, path_url, data=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("transient")
+            return await super()._api_post(path_url, data)
+
+    ctrl = _controller(_MarketDataWithSpot(_FlakyConnector(_spot_state())))
+    assert asyncio.run(ctrl._current_margin_available()) == 0.0   # fail closed, uncached
+    assert asyncio.run(ctrl._current_margin_available()) == 0.0   # circuit blocks immediate retry
+    assert len(calls) == 1
+
+
+def test_margin_read_has_deadline_and_opens_backoff_circuit():
+    import asyncio
+
+    class _HungConnector(_ConnectorWithSpotState):
+        async def _api_post(self, path_url, data=None):
+            await asyncio.Event().wait()
+
+    ctrl = _controller(_MarketDataWithSpot(_HungConnector(_spot_state())))
+    ctrl.config = _config(venue_request_timeout=0.01)
+
+    assert asyncio.run(ctrl._current_margin_available()) == 0.0
+    snapshot = ctrl._venue_circuit.snapshot(ctrl.market_data_provider.time())
+    assert snapshot["consecutive_failures"] == 1
+    assert snapshot["retry_in_s"] > 0
+
+
+def test_margin_429_uses_circuit_breaker_instead_of_hammering():
+    import asyncio
+
+    calls = []
+
+    class _RateLimitedConnector(_ConnectorWithSpotState):
+        async def _api_post(self, path_url, data=None):
+            calls.append(1)
+            raise RuntimeError("HTTP 429 Too Many Requests")
+
+    ctrl = _controller(_MarketDataWithSpot(_RateLimitedConnector(_spot_state())))
+    assert asyncio.run(ctrl._current_margin_available()) == 0.0
+    assert asyncio.run(ctrl._current_margin_available()) == 0.0
+    assert calls == [1]
+    assert ctrl._venue_circuit.snapshot(ctrl.market_data_provider.time())["rate_limited"] is True

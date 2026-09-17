@@ -12,8 +12,11 @@ controller config *before* any controller is created, and refuses to start on:
     controller account's `HYPERLIQUID_<ACCOUNT_ID>_ACCOUNT_ADDRESS`.
 
 Launch (from the HB root, inside the hummingbot conda env):
-  CONFIG_PASSWORD=... SCRIPT_CONFIG=opms_perp_mm_e2_mm1_shadow.yml HEADLESS_MODE=true \
-  python bin/hummingbot_quickstart.py
+  CONFIG_PASSWORD=... SCRIPT_CONFIG=opms_perp_mm_e2_mm1_shadow.yml \
+  python <amm-solution>/hb-enhanced-opms/deploy/hummingbot/scripts/run_hummingbot_isolated.py
+
+The isolated launcher intentionally bypasses the stock headless loop's MQTT
+requirement; process signals remain the deployment control plane.
 """
 
 import os

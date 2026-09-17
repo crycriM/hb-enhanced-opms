@@ -124,13 +124,15 @@ class TestExecutionRouting:
         assert c.child_order_time_limit == 5.0
         assert c.child_order_refresh_time == 5.0
 
-    def test_immediate_routes_to_twap(self, config, md):
-        """immediate → TWAPExecutorConfig (real HB class name)."""
+    def test_immediate_routes_to_bounded_pa(self, config, md):
+        """immediate quote-stop flatten → one bounded reduce-only PA child."""
         req = ExecutionRequest(side="sell", amount=5.0, urgency="immediate", reduce_only=True)
         actions = _exec_actions(req, config, md)
         c = actions[0]["config"]
-        assert c.type == "twap_executor"
-        assert c.total_duration == 120
+        assert isinstance(c, PassiveAggressiveExecutorConfig)
+        assert c.total_amount_base == Decimal("5.0")
+        assert c.child_order_quantity == Decimal("5.0")
+        assert c.child_order_time_limit == 15.0
 
     def test_emergency_below_min_size_falls_back(self, config, md):
         """emergency below min_order_size → OrderExecutorConfig MARKET."""
@@ -186,15 +188,16 @@ def _exec_actions(req: ExecutionRequest, config, md):
         return [{"config": c}]
 
     if req.urgency == "immediate":
-        from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig
-        c = TWAPExecutorConfig(
+        c = PassiveAggressiveExecutorConfig(
             timestamp=ts,
             connector_name=config.connector_name,
             trading_pair=config.trading_pair,
             side=side,
-            total_amount_quote=Decimal(str(req.amount)),
-            total_duration=120,
-            order_interval=30,
+            total_amount_base=Decimal(str(req.amount)),
+            child_order_quantity=Decimal(str(req.amount)),
+            child_order_time_limit=15.0,
+            child_order_refresh_time=15.0,
+            leverage=config.leverage,
         )
         return [{"config": c}]
 

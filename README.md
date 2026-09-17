@@ -4,6 +4,8 @@ Hummingbot-based execution body: controllers, executors, and a Gateway bridge wi
 
 OPMS is the execution layer of the [amm-solution](https://github.com/amm-solution) spot and perpetual market-making system. It sits between the `mm_core` decision engine (the "brain") and Hummingbot (the "body"), translating `ExecIntent` from Keeper into venue-agnostic order specs, running execution algorithms, and collecting fill-level analytics.
 
+> Current run status, known issues, and required local patches live in [`status.md`](status.md), not here.
+
 ## Architecture
 
 ```
@@ -33,6 +35,11 @@ OPMS is the execution layer of the [amm-solution](https://github.com/amm-solutio
 3. **Executors** (`ACScheduleExecutor`, `PassiveAggressiveExecutor`) consume specs and submit orders to the HB connector.
 4. **Analytics** (`FillObserver`) watches fill events, computing PnL, markout, and slippage.
 5. **Forecasting** (`HistoricalProfileForecaster`) provides volume-aware scheduling for AC executor.
+
+The bridge also applies the shared schema-v2 `PortfolioExecIntent` generation
+gate. Grouped generations are admitted/deduplicated in shadow-only mode; live
+multi-account placement remains disabled until a central portfolio coordinator
+owns cancellation acknowledgements and account routing.
 
 ## Modules
 
@@ -116,12 +123,9 @@ python -m pytest tests_real/ -q     # real-HB tests, no stubs
 
 ⚠ **Local patch to the pinned checkout.** The HL WS funding parser
 (`hyperliquid_perpetual_api_order_book_data_source.py::_parse_funding_info_message`)
-used `ctx.get("openInterest", ctx.get("funding", "0"))` as the rate. HL's
-`activeAssetCtx` payload carries both fields, so the connector reported open
-interest (~1e6) as funding — which the keeper would accrue as funding PnL on
-every tick. It is patched locally to `ctx.get("funding", "0")`. **Re-apply
-after any Hummingbot update.** `scripts/run_hb_mainnet_smoke.py` fails if the
-rate is implausible (≥ 0.01), so the regression is caught.
+is patched locally to read only `ctx.get("funding", "0")`. **Re-apply after
+any Hummingbot update** — `scripts/run_hb_mainnet_smoke.py` catches the
+regression if it's missing. See [`status.md`](status.md) for why.
 
 Notes:
 
@@ -140,14 +144,18 @@ Notes:
 
 Credentials live in the repo-root `.env` (values are secrets — never commit
 this file; add `.env` to `.gitignore`). Each subaccount has its own key
-triple, in the `{EXCHANGE}_{ACCOUNT_ID}_{CREDENTIAL_TYPE}` shape:
+triple, in the `{EXCHANGE}_{ACCOUNT_ID}_{CREDENTIAL_TYPE}` shape — e.g.
+`PRIVATE_KEY`, `ACCOUNT_ADDRESS`, `IS_TESTNET`. The keeper's `account_id`
+(set per `PerpPairConfig` / `PerpMMControllerConfig`) selects which
+subaccount's credentials to use; there is one such triple per subaccount you
+run.
 
-| Subaccount | Keeper `account_id` | `.env` keys | Collateral |
-|---|---|---|---|
-| `HYPERLIQUID_E2_MM1` | `basket_a` (Sub A) | `HYPERLIQUID_E2_MM1_PRIVATE_KEY`, `HYPERLIQUID_E2_MM1_ACCOUNT_ADDRESS`, `HYPERLIQUID_E2_MM1_IS_TESTNET` | 300 USDC |
-| `HYPERLIQUID_E2_MM2` | `basket_b` (Sub B) | `HYPERLIQUID_E2_MM2_PRIVATE_KEY`, `HYPERLIQUID_E2_MM2_ACCOUNT_ADDRESS`, `HYPERLIQUID_E2_MM2_IS_TESTNET` | 300 USDC |
+The basket controllers run at **6x leverage**, targeting `+0.4 ETH / -4 SOL`
+gross per account. The calibrated `max_position` values are inventory bounds,
+not a request to fill the entire cap — size against current collateral (see
+[`status.md`](status.md) for last-recorded balances).
 
-`HYPERLIQUID_E2_MAIN_*` holds the master-agent key set (used at
+`{EXCHANGE}_MAIN_*` holds the master-agent key set (used at
 `createSubAccount` time). See `perp-bot/docs/account-naming.md` for the full
 subaccount-auth mechanics and the rule to use an **agent-wallet** key for
 `_PRIVATE_KEY` (no withdraw rights), never the master's own key.
@@ -169,8 +177,8 @@ agent key), auto-detecting which from `HYPERLIQUID_MASTER_ACCOUNT_ADDRESS`.
 HB's connector then signs every request with `vaultAddress=<subaccount>`
 (`HyperliquidPerpetualAuth._vault_address`). ⚠ Hummingbot keys credentials by
 **connector name**, and there is only one `hyperliquid_perpetual` slot — so a
-subaccount import overwrites a master import, and running `e2_mm1` and
-`e2_mm2` concurrently needs two separate HB instances (or a future
+subaccount import overwrites a master import, and running multiple
+subaccounts concurrently needs one HB instance per subaccount (or a future
 connector-name split). Verify with `--dry-run` before importing.
 - **`dex_executor`'s `AccountRegistry`:** reads `{EXCHANGE}_{ACCOUNT_ID}_...`
   vars from the environment live. This path is currently bypassed for live HL
@@ -179,15 +187,14 @@ connector-name split). Verify with `--dry-run` before importing.
 The `.env` keys above are the canonical shape both paths (and the import
 script's one-off env vars) follow.
 
-**⚠ `account_id` must stay consistent across the stack.** `basket_config.py`
-labels the two keepers `account_id="basket_a"` / `"basket_b"`; those labels
-thread into `validate_account_topology`, decision logs, and the OPMS fills
-websocket (`/ws/fills/hyperliquid?account_id=...`). Map `basket_a` →
-`HYPERLIQUID_E2_MM1` and `basket_b` → `HYPERLIQUID_E2_MM2` and keep that slug
-identical between `PerpPairConfig` and the corresponding `PerpMMControllerConfig`
-(so the connector's `vaultAddress` points at the matching subaccount). Getting
-it wrong silently misroutes fills/logs even though the trade still hits the
-right wallet.
+**⚠ `account_id` must stay consistent across the stack.** Each keeper config
+assigns a distinct `account_id`, and that label threads into
+`validate_account_topology`, decision logs, and the OPMS fills websocket
+(`/ws/fills/hyperliquid?account_id=...`). Keep that slug identical between
+`PerpPairConfig` and the corresponding `PerpMMControllerConfig` for a given
+subaccount (so the connector's `vaultAddress` points at the matching
+subaccount). Getting it wrong silently misroutes fills/logs even though the
+trade still hits the right wallet.
 
 ### Hummingbot Gateway (for DEX connectors — optional for perp)
 
@@ -228,7 +235,10 @@ Tests do not require a live Hummingbot runtime. The `conftest.py` injects stub m
 
 **Run `tests_real/` in its own invocation** — it deliberately does *not* use the
 stubs and imports the real Hummingbot, so it must not share a process with
-`tests/` (whose conftest injects stubs into `sys.modules`):
+`tests/` (whose conftest injects stubs into `sys.modules`). It skips
+automatically when Hummingbot is not importable — see
+[`status.md`](status.md) for bugs it has previously caught that the stub
+suite missed.
 
 ```bash
 pytest tests_real/ -q                                  # real-HB controller + connector structure
@@ -241,7 +251,7 @@ standalone script rather than a pytest test, because HB connectors spawn
 background tasks that outlive pytest-asyncio's per-test event loop:
 
 ```bash
-OPMS_HB_MAINNET=confirm python scripts/run_hb_mainnet_smoke.py --account-id e2_mm1
+OPMS_HB_MAINNET=confirm python scripts/run_hb_mainnet_smoke.py --account-id <account-id>
 ```
 
 The **write** gate places real orders: the controller's own quote becomes two
@@ -254,7 +264,7 @@ market-closed) through the raw HL SDK. Run `--dry-run` first; artifacts
 
 ```bash
 OPMS_HB_MAINNET=confirm OPMS_HB_PLACE_ORDERS=confirm \
-  python scripts/run_hb_mainnet_quote_gate.py --account-id e2_mm1 --max-position 0.06 --dry-run
+  python scripts/run_hb_mainnet_quote_gate.py --account-id <account-id> --max-position 0.06 --dry-run
 ```
 
 HL rejects orders under $10 notional; quote size is 10% of `--max-position`,
@@ -269,7 +279,7 @@ creates. Takes ~3–5 minutes:
 
 ```bash
 OPMS_HB_MAINNET=confirm OPMS_HB_PLACE_ORDERS=confirm \
-  python scripts/run_hb_mainnet_derisk_gate.py --account-id e2_mm1 --dry-run
+  python scripts/run_hb_mainnet_derisk_gate.py --account-id <account-id> --dry-run
 ```
 
 ### Real Hummingbot launch (`deploy/`)
@@ -283,30 +293,52 @@ OPMS_HB_MAINNET=confirm OPMS_HB_PLACE_ORDERS=confirm \
   controller's `account_id` (HB has one `hyperliquid_perpetual` slot).
 - `controllers/generic/perp_mm.py` — re-exports `PerpMMController` where HB's
   loader looks (`controllers.<controller_type>.<controller_name>`).
-- `conf/scripts/opms_perp_mm_e2_mm1_shadow.yml` +
-  `conf/controllers/perp_mm_e2_mm1_eth_shadow.yml` — one untilted ETH
-  controller on `e2_mm1`, `shadow_mode: true`, micro caps, 5 s cycle.
+- `conf/scripts/opms_perp_mm_<account>_shadow.yml` +
+  `conf/controllers/perp_mm_<account>_{eth,sol}_shadow.yml` — the two tilted
+  ETH/SOL basket legs for a given subaccount, `shadow_mode: true`, calibrated
+  caps, 6x leverage, and a 5 s cycle. This set repeats per subaccount you run.
+
+Validate both configs with Hummingbot's own loader and the deploy-time routing
+checks (no network, no orders):
+
+```bash
+python scripts/validate_hb_deploy_configs.py
+```
+
+For a bounded live read-only check, `deploy/run_dual_shadow_session.sh` creates
+two disposable Hummingbot runtimes, imports one subaccount into each encrypted
+store, and starts both instances concurrently. It requires
+`OPMS_HB_MAINNET=confirm`; set `HB_PASSWORD` only when reusing an existing
+Hummingbot store. The runner keeps all four controllers in `shadow_mode`:
+
+```bash
+OPMS_HB_MAINNET=confirm deploy/run_dual_shadow_session.sh 1800
+```
+
+For an explicitly authorized single-account mainnet soak, use the disposable
+single-account runner. It starts both calibrated ETH/SOL controllers at 6x for the
+requested duration, monitors margin read-only, then cancels and market-closes
+scoped state before verifying a flat account. The runner requires both
+`OPMS_HB_MAINNET=confirm` and `OPMS_HB_PLACE_ORDERS=confirm`. All bounded
+deploy runners use `run_hummingbot_isolated.py`, which starts the real
+trading core headlessly with MQTT disabled and still performs normal
+strategy/order shutdown on `SIGINT`/`SIGTERM`. See
+[`status.md`](status.md) for the latest soak result before relying on the
+behavioral safety gate.
+
+```bash
+OPMS_HB_MAINNET=confirm OPMS_HB_PLACE_ORDERS=confirm \
+  deploy/run_single_live_soak.sh 1800
+```
 
 One-time: choose an HB password, put `HB_PASSWORD=...` in the monorepo `.env`,
-then `python scripts/import_hl_mainnet_credentials.py --account-id e2_mm1`.
+then `python scripts/import_hl_mainnet_credentials.py --account-id <account-id>`.
 A shadow session (no orders) followed by Phase-1 parity — the HB log replayed
 through a standalone `Keeper` (`perp-bot/scripts/replay_decision_log.py`):
 
 ```bash
 deploy/run_shadow_session.sh 1800   # seconds
 ```
-
-`tests_real/` skips automatically when Hummingbot is not importable. It caught
-three real bugs the stub suite masked: `PerpMMController` imported a
-`TwapExecutorConfig` that does not exist in Hummingbot (the real class is
-`TWAPExecutorConfig`, with `total_amount_quote`/`total_duration`/
-`order_interval`), the custom `PassiveAggressiveExecutorConfig` type was never
-registered in HB's `ExecutorOrchestrator._executor_mapping` (so every
-de-risk/emergency executor would have raised "Unsupported executor config
-type"), and `_current_equity()` looked up `"USDC"` while HB's Hyperliquid
-connector reports the balance under `"USD"` (silent zero equity). All three are
-fixed; `PerpMMController` now registers the executor at import time and
-resolves equity against the connector's actual balances.
 
 ## Dependency layout
 
@@ -326,7 +358,7 @@ hb-enhanced-opms/
 │   │   └── passive_aggressive_executor.py
 │   ├── forecasting/
 │   │   └── historical_profile.py
-   │   ├── gateway/             # GatewayExecBridge — HTTP client to the Hummingbot Gateway (DEX only)
+│   ├── gateway/             # GatewayExecBridge — HTTP client to the Hummingbot Gateway (DEX only)
 │   ├── research/            # (reserved)
 │   └── risk/                # (reserved)
 └── tests/

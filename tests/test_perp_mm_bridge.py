@@ -11,6 +11,11 @@ import time
 import pytest
 
 from mm_core.inventory import Caps
+from mm_core.contracts import (
+    LegQuoteSpec,
+    PortfolioDecisionAudit,
+    PortfolioExecIntent,
+)
 
 from perp_bot.config import PerpPairConfig
 from perp_bot.keeper import Keeper
@@ -112,6 +117,105 @@ def test_intent_to_order_specs_quote():
     assert specs == [
         OrderSpec(cancel_all=True, side="buy", price=99.0, amount=1.0, urgency="normal"),
         OrderSpec(cancel_all=False, side="sell", price=101.0, amount=1.0, urgency="normal"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_in_process_client_admits_grouped_generation_and_dedupes():
+    intent = PortfolioExecIntent(
+        schema_version=2,
+        venue="hyperliquid",
+        coin="BTC",
+        portfolio_id="btc-mirror",
+        generation=1,
+        as_of_ts=time.time() - 1.0,
+        expires_at=time.time() + 10.0,
+        quotes=(
+            LegQuoteSpec("long", "buy", 99.0, 1.0, False),
+            LegQuoteSpec("short", "sell", 101.0, 1.0, False),
+        ),
+        target_net_inventory_base=0.0,
+        client_id="btc-mirror-1",
+        cancel_previous=True,
+        audit=PortfolioDecisionAudit(
+            ts=time.time() - 1.0,
+            net_base=0.0,
+            gross_notional_usd=200.0,
+        ),
+    )
+    client = InProcessClient()
+
+    accepted = await client.send_intent(intent)
+    duplicate = await client.send_intent(intent)
+
+    assert accepted["status"] == "accepted"
+    assert duplicate["status"] == "duplicate"
+    assert client.last_portfolio_intent == intent
+
+
+@pytest.mark.asyncio
+async def test_in_process_client_rejects_stale_grouped_generation():
+    now = time.time()
+    base = dict(
+        schema_version=2,
+        venue="hyperliquid",
+        coin="BTC",
+        portfolio_id="btc-mirror",
+        as_of_ts=now - 1.0,
+        expires_at=now + 10.0,
+        quotes=(LegQuoteSpec("long", "buy", 99.0, 1.0, False),),
+        target_net_inventory_base=0.0,
+        cancel_previous=True,
+        audit=PortfolioDecisionAudit(ts=now - 1.0, net_base=0.0, gross_notional_usd=100.0),
+    )
+    client = InProcessClient()
+    await client.send_intent(PortfolioExecIntent(generation=2, client_id="new", **base))
+
+    stale = await client.send_intent(
+        PortfolioExecIntent(generation=1, client_id="old", **base)
+    )
+
+    assert stale["status"] == "rejected"
+    assert "generation_stale" in stale["errors"]
+
+
+@pytest.mark.parametrize(
+    ("position", "expected_buy_reduce_only", "expected_sell_reduce_only"),
+    [
+        (0.0769, False, True),
+        (-2.0, True, False),
+        (0.0, False, False),
+    ],
+)
+def test_inventory_reducing_quote_side_is_reduce_only(
+    position, expected_buy_reduce_only, expected_sell_reduce_only
+):
+    """Venue reduce-only is the last line of defence against stale quote
+    overlap flipping a position through flat."""
+    from mm_core.contracts import ExecIntent, QuoteSpec
+
+    intent = ExecIntent(
+        venue="hyperliquid", coin="BTC", target_inventory=0.4,
+        current_inventory=position,
+        quote=QuoteSpec(bid_price=99.0, ask_price=101.0, bid_size=1.0, ask_size=1.0),
+    )
+    specs = intent_to_order_specs(intent)
+
+    assert specs[0].reduce_only is expected_buy_reduce_only
+    assert specs[1].reduce_only is expected_sell_reduce_only
+
+
+def test_zero_sized_quote_side_is_not_routed():
+    from mm_core.contracts import ExecIntent, QuoteSpec
+
+    intent = ExecIntent(
+        venue="hyperliquid", coin="BTC", target_inventory=0.4,
+        current_inventory=0.0,
+        quote=QuoteSpec(bid_price=99.0, ask_price=None, bid_size=0.1, ask_size=0.0),
+    )
+
+    assert intent_to_order_specs(intent) == [
+        OrderSpec(cancel_all=True, side="buy", price=99.0, amount=0.1, urgency="normal"),
     ]
 
 

@@ -456,6 +456,13 @@ async def main() -> int:
         forced = await _stop_executors(executors)
         if forced:
             failures.append(f"executor(s) {forced} did not terminate on early_stop() — forced")
+        # Quote replacement is intentionally two-phase: cancellation must be
+        # confirmed before target-capped replacements are allowed to exist.
+        controller.executors_info = []
+        creates = [
+            action for action in controller.determine_executor_actions()
+            if not isinstance(action, StopExecutorAction)
+        ]
         executors = _create_executors(creates, strategy)
         new_oids = await _await_oids(executors, args.timeout)
         after = _resting_oids(info, address, coin)

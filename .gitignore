@@ -143,5 +143,7 @@ logs/
 *.db
 *.sqlite
 .secrets/
+project-internal/
 credentials.json
-
+docs/
+deploy/hummingbot/conf

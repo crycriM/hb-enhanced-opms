@@ -8,8 +8,10 @@ runtime and keeps "one module speaks Hummingbot" (perp_mm_controller.py).
 """
 
 from dataclasses import dataclass
+import time
 
-from mm_core.contracts import ExecIntent
+from mm_core.contracts import ExecIntent, PortfolioExecIntent
+from mm_core.portfolio_execution import AdmissionStatus, PortfolioIntentGate
 
 from perp_bot.opms_client import Position
 
@@ -42,6 +44,8 @@ class InProcessClient:
     def __init__(self):
         self._positions: dict[str, Position] = {}
         self.last_intent: ExecIntent | None = None
+        self.last_portfolio_intent: PortfolioExecIntent | None = None
+        self._portfolio_gate = PortfolioIntentGate()
         self._on_snapshot_cb = None
         self._on_fill_cb = None
         self._on_error_cb = None
@@ -64,9 +68,46 @@ class InProcessClient:
     async def stop(self):
         pass
 
-    async def send_intent(self, intent: ExecIntent) -> dict:
+    async def send_intent(self, intent: ExecIntent | PortfolioExecIntent) -> dict:
+        if isinstance(intent, PortfolioExecIntent):
+            return await self.send_portfolio_intent(intent)
         self.last_intent = intent
         return {}
+
+    async def send_portfolio_intent(self, intent: PortfolioExecIntent) -> dict:
+        """Admit grouped generations without pretending HB can execute them.
+
+        The current controller owns one configured account, while a grouped
+        intent may contain several accounts.  We still apply the shared
+        schema/generation gate so shadow tooling observes the same acceptance
+        semantics as native OPMS; live child placement remains disabled until a
+        portfolio coordinator is wired around the controller.
+        """
+        admission = self._portfolio_gate.admit(intent, now=time.time())
+        if admission.status is AdmissionStatus.REJECTED:
+            return {
+                "status": "rejected",
+                "portfolio_id": intent.portfolio_id,
+                "generation": intent.generation,
+                "errors": list(admission.errors),
+            }
+        if admission.status is AdmissionStatus.DUPLICATE:
+            previous = admission.previous
+            return {
+                "status": "duplicate",
+                "portfolio_id": intent.portfolio_id,
+                "generation": intent.generation,
+                "strategy_ids": list(previous.strategy_ids if previous else ()),
+            }
+        self.last_portfolio_intent = intent
+        self._portfolio_gate.commit(admission, strategy_ids=())
+        return {
+            "status": "accepted",
+            "execution": "shadow_only",
+            "portfolio_id": intent.portfolio_id,
+            "generation": intent.generation,
+            "strategy_ids": [],
+        }
 
     async def get_positions(self) -> dict[str, Position]:
         return self._positions
@@ -108,15 +149,18 @@ def intent_to_order_specs(intent: ExecIntent | None) -> list[OrderSpec]:
 
     if intent.quote is not None:
         specs = []
-        if intent.quote.bid_price is not None:
+        current = intent.current_inventory or 0.0
+        if intent.quote.bid_price is not None and intent.quote.bid_size > 0:
             specs.append(OrderSpec(cancel_all=True, side="buy",
                                     price=intent.quote.bid_price,
                                     amount=intent.quote.bid_size,
+                                    reduce_only=current < 0,
                                     urgency=intent.urgency))
-        if intent.quote.ask_price is not None:
+        if intent.quote.ask_price is not None and intent.quote.ask_size > 0:
             specs.append(OrderSpec(cancel_all=len(specs) == 0, side="sell",
                                     price=intent.quote.ask_price,
                                     amount=intent.quote.ask_size,
+                                    reduce_only=current > 0,
                                     urgency=intent.urgency))
         return specs or [OrderSpec(cancel_all=True)]
 

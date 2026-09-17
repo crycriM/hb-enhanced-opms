@@ -166,10 +166,18 @@ class _A2Runner:
             self._inject_state(position_exists=False)
             record = await self._cycle()
             if record.action == "initial_deposit" and self.keeper._current_position_id:
+                if not self.is_fake and not getattr(self.keeper, "_extra_position_ids", []):
+                    raise A2StepError(
+                        "initial_deposit: two-sided ladder opened no ask-side PDA "
+                        "(expected the ask deposit to be tracked)"
+                    )
                 return PhaseEvidence(
                     "initial_deposit", self.cycle_no, record.decision, record.action,
                     position_id=self.keeper._current_position_id,
-                    detail=f"active_bin={self.keeper._active_bin}",
+                    detail=(
+                        f"active_bin={self.keeper._active_bin} "
+                        f"extras={list(getattr(self.keeper, '_extra_position_ids', []))}"
+                    ),
                 )
         raise A2StepError(
             f"initial_deposit: not reached in {self.max_cycles} cycles "
@@ -197,7 +205,10 @@ class _A2Runner:
             return PhaseEvidence(
                 "drift_refresh", self.cycle_no, record.decision, record.action,
                 position_id=self.keeper._current_position_id,
-                detail=record.refresh_reason,
+                detail=(
+                    f"{record.refresh_reason} "
+                    f"extras={list(getattr(self.keeper, '_extra_position_ids', []))}"
+                ),
             )
         raise A2StepError(f"drift_refresh: not reached in {self.max_cycles} cycles")
 
@@ -216,6 +227,11 @@ class _A2Runner:
                 raise A2StepError("tvl_emergency: decision fired but keeper not halted")
             if self.keeper._current_position_id is not None:
                 raise A2StepError("tvl_emergency: position not withdrawn")
+            if getattr(self.keeper, "_extra_position_ids", []):
+                raise A2StepError(
+                    "tvl_emergency: ask-side PDAs left open: "
+                    f"{self.keeper._extra_position_ids}"
+                )
             return PhaseEvidence(
                 "tvl_emergency", self.cycle_no, record.decision, record.action,
                 detail=record.refresh_reason,
@@ -257,9 +273,11 @@ def _build_keeper(args, bridge) -> Keeper:
         grid=grid,
         pool_address=args.pool,
         drift_threshold_bins=args.drift_threshold_bins,
+        max_active_bin_slippage=args.max_active_bin_slippage,
         refresh_interval=args.refresh_interval,
         pair_type=PairType(args.pair_type),
         dry_run=False,
+        log_dir=args.log_dir,
         base_mint=args.base_mint,
         quote_mint=args.quote_mint,
     )
@@ -286,6 +304,9 @@ def build_args(argv=None):
     ap.add_argument("--capital", type=float, default=1000.0)
     ap.add_argument("--level-weight", type=float, default=0.2)
     ap.add_argument("--drift-threshold-bins", type=int, default=3)
+    ap.add_argument("--max-active-bin-slippage", type=int, default=2)
+    ap.add_argument("--log-dir", default=None,
+                   help="keeper event-log dir (required for replay conformance)")
     ap.add_argument("--refresh-interval", type=float, default=5.0)
     ap.add_argument("--pair-type", default="bluechip")
     ap.add_argument("--base-mint", default="")
@@ -299,6 +320,30 @@ def build_args(argv=None):
     ap.add_argument("--pace-s", type=float, default=0.0)
     ap.add_argument("--out", default="shadow-a2-report.json")
     return ap.parse_args(argv)
+
+
+GATEWAY_ENV_KEYS = (
+    "SOLANA_RPC_URL", "SOLANA_RPC_WRITE_URL", "SOLANA_WS_URL",
+    "SOLANA_RPC_MAX_CU_PER_SECOND", "SOLANA_COMMITMENT", "WALLET_SIGNER",
+    "KMS_KEY_ARN", "WALLET_KEYPAIR_PATH", "WALLET_PUBKEY",
+    "FILE_SIGNER_ALLOW_MAINNET", "POOL_ALLOWLIST", "MINT_ALLOWLIST",
+    "MAX_SOL_PER_TX", "MAX_SOL_PER_RUN", "MAX_SLIPPAGE_BPS",
+    "MAX_PRIORITY_FEE_LAMPORTS", "MAX_ACTIVE_BIN_SLIPPAGE_BINS",
+    "JITO_ENABLED", "JITO_BLOCK_ENGINE_URL", "JITO_TIP_LAMPORTS",
+    "JITO_TIP_ACCOUNT", "JITO_TIP_ACCOUNTS",
+)
+
+
+def _scrub_gateway_env(run_dir: str) -> None:
+    """ExecBridge inherits os.environ: keep only base vars plus the explicit
+    gateway allow-list, mirroring the executor harness's WRITE_GATEWAY_KEYS,
+    and point the executor's scratch paths at the run directory."""
+    keep = {k: v for k, v in os.environ.items()
+            if k in ("PATH", "HOME", "LANG", "TZ") or k in GATEWAY_ENV_KEYS}
+    os.environ.clear()
+    os.environ.update(keep)
+    os.environ["SWAP_STREAM_PATH"] = os.path.join(run_dir, "swaps.jsonl")
+    os.environ["EXECUTOR_LOG_DIR"] = os.path.join(run_dir, "executor")
 
 
 def main(argv=None) -> int:
@@ -315,9 +360,34 @@ def main(argv=None) -> int:
         if not args.pool or not args.wallet:
             logger.error("subprocess bridge needs --pool and --wallet")
             return 2
-        if os.environ.get("CONFIRM") != "yes":
-            os.environ.setdefault("DRY_RUN", "true")
+        confirm = os.environ.get("CONFIRM") == "yes"
+        dry_run_env = os.environ.get("DRY_RUN")
+        run_dir = os.path.splitext(args.out)[0] + "-run"
+        os.makedirs(run_dir, exist_ok=True)
+        _scrub_gateway_env(run_dir)
+        if not confirm:
+            os.environ["DRY_RUN"] = "true"
             logger.warning("CONFIRM != yes: executor runs DRY_RUN=true (no signing)")
+        else:
+            os.environ["DRY_RUN"] = "false"
+            for key in (
+                "SOLANA_RPC_URL", "WALLET_PUBKEY", "WALLET_KEYPAIR_PATH",
+                "POOL_ALLOWLIST", "MINT_ALLOWLIST", "MAX_SOL_PER_TX",
+                "MAX_SOL_PER_RUN", "MAX_SLIPPAGE_BPS",
+                "MAX_ACTIVE_BIN_SLIPPAGE_BINS", "MAX_PRIORITY_FEE_LAMPORTS",
+            ):
+                if not os.environ.get(key):
+                    logger.error("CONFIRM=yes requires %s in the environment", key)
+                    return 2
+            if dry_run_env != "false":
+                logger.error("CONFIRM=yes requires DRY_RUN=false in the sourced env (real signing)")
+                return 2
+            if os.environ.get("WALLET_SIGNER") != "file":
+                logger.error("this dust campaign expects WALLET_SIGNER=file")
+                return 2
+        if args.wallet != os.environ.get("WALLET_PUBKEY", ""):
+            logger.error("--wallet does not match the pinned WALLET_PUBKEY")
+            return 2
         bridge = ExecBridge(cmd=["node", "dist/bridge.js"], cwd=args.executor_cwd)
 
     bridge.start()
