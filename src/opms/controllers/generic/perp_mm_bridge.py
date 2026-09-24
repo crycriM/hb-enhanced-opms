@@ -67,7 +67,7 @@ class InProcessClient:
             intent is not None
             and intent.quote is None
             and position is not None
-            and abs(position.position) < 1e-12
+            and abs(position.position - intent.target_inventory) < 1e-12
         ):
             self.last_intent = None
 
@@ -80,6 +80,17 @@ class InProcessClient:
     async def send_intent(self, intent: ExecIntent | PortfolioExecIntent) -> dict:
         if isinstance(intent, PortfolioExecIntent):
             return await self.send_portfolio_intent(intent)
+        current = self.last_intent
+        position = self._positions.get(current.coin) if current is not None else None
+        if (
+            current is not None
+            and current.quote is None
+            and position is not None
+            and abs(position.position - current.target_inventory) >= 1e-12
+        ):
+            priority = {"immediate": 1, "emergency": 2}
+            if intent.quote is not None or priority.get(intent.urgency, 0) < priority.get(current.urgency, 0):
+                return {}
         self.last_intent = intent
         return {}
 
