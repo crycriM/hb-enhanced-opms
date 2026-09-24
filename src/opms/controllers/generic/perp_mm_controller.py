@@ -9,6 +9,7 @@ mm_core + Keeper — nothing is re-implemented here.
 import asyncio
 import logging
 import os
+import time
 from decimal import ROUND_CEILING, Decimal
 from typing import List, Union
 
@@ -362,7 +363,7 @@ class PerpMMController(ControllerBase):
 
         self._fill_observer.update_mid(float(mid))
 
-        current_position = float(self._current_base_position())
+        current_position = self._position_for_decision()
         self._client.set_positions({
             self.config.coin: Position(
                 coin=self.config.coin,
@@ -425,6 +426,21 @@ class PerpMMController(ControllerBase):
                 continue
             total += Decimal(str(p.amount))
         return total
+
+    def _position_for_decision(self) -> float:
+        """Keep recent fills from being erased by HL's lagging position cache."""
+        venue = float(self._current_base_position())
+        observer = getattr(self, "_fill_observer", None)
+        last_fill = getattr(observer, "last_fill_ts", None)
+        if last_fill is None or time.time() - last_fill > 30.0:
+            return venue
+        filled = float(observer.position)
+        target = float(self.config.target_inventory)
+        if target > 0:
+            return max(venue, filled)
+        if target < 0:
+            return min(venue, filled)
+        return filled if abs(filled) > abs(venue) else venue
 
     async def _current_margin_available(self) -> float:
         """Venue-computed liquidation distance for the margin-health stop.

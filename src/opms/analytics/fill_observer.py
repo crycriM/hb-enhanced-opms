@@ -67,6 +67,7 @@ class FillObserver:
         self._slippage_bps: list[float] = []
         self._last_mid: Optional[float] = None
         self._last_mid_ts: Optional[float] = None
+        self.last_fill_ts: Optional[float] = None
 
         # HB event forwarder — registered against the connector
         self._fill_forwarder = SourceInfoEventForwarder(self._on_fill_event)
@@ -131,6 +132,7 @@ class FillObserver:
             return
 
         ts = time.time()
+        self.last_fill_ts = ts
         side = "buy" if event.trade_type == TradeType.BUY else "sell"
         price = float(event.price)
         size = float(event.amount)
