@@ -357,9 +357,10 @@ disposable Hummingbot runtimes, with opposite ETH/SOL tilts and one shared
 portfolio-stop database. It refuses to launch unless both accounts have
 distinct agent signers, clean ETH/SOL state, at least 300 USDC each, and
 explicit mainnet/order confirmation. Each account has an independent margin
-and drawdown monitor. At the deadline or on an early failure, the runner stops
-both instances, cancels scoped orders, closes scoped positions, and checks
-both accounts are flat. Logs and preflight/cleanup snapshots go to
+health and initial-margin check; drawdown is measured once against the peak of
+their combined equity. At the deadline or on an early failure, the runner
+stops both instances, cancels scoped orders, closes scoped positions, and
+checks both accounts are flat. Logs and preflight/cleanup snapshots go to
 `logs/live_dual_soak_<timestamp>/`. The collateral threshold defaults to
 300 USDC per account (`MIN_COLLATERAL`).
 
