@@ -313,3 +313,31 @@ def test_flat_position_retires_stale_non_quoting_intent():
         "ETH": Position(coin="ETH", position=0.0, equity=700.0),
     })
     assert client.last_intent is None
+
+
+@pytest.mark.asyncio
+async def test_non_quoting_intent_stays_latched_until_target_is_reached():
+    from mm_core.contracts import ExecIntent, QuoteSpec
+
+    client = InProcessClient()
+    flatten = ExecIntent(
+        venue="hyperliquid", coin="ETH", target_inventory=0.0,
+        current_inventory=0.1, quote=None, urgency="emergency",
+    )
+    client.set_positions({"ETH": Position(coin="ETH", position=0.1, equity=300.0)})
+    await client.send_intent(flatten)
+
+    quote = ExecIntent(
+        venue="hyperliquid", coin="ETH", target_inventory=0.4,
+        current_inventory=0.1,
+        quote=QuoteSpec(bid_price=2999.0, ask_price=3001.0,
+                        bid_size=0.1, ask_size=0.1),
+        urgency="passive",
+    )
+    await client.send_intent(quote)
+    assert client.last_intent is flatten
+
+    client.set_positions({"ETH": Position(coin="ETH", position=0.0, equity=300.0)})
+    assert client.last_intent is None
+    await client.send_intent(quote)
+    assert client.last_intent is quote
