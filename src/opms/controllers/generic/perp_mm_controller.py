@@ -626,7 +626,9 @@ class PerpMMController(ControllerBase):
         keep: set[str] = set()
 
         if intent_is_quoting(self._client.last_intent):
-            specs = intent_to_order_specs(self._client.last_intent)
+            specs = self._executable_quote_specs(
+                intent_to_order_specs(self._client.last_intent)
+            )
             now = self.market_data_provider.time()
             execution_active = [e for e in active if not self._is_quote_executor(e)]
             if execution_active:
@@ -776,6 +778,20 @@ class PerpMMController(ControllerBase):
                 ),
             )
             for spec in specs if spec.side is not None and spec.amount > 0
+        ]
+
+    def _executable_quote_specs(self, specs):
+        rules = self.market_data_provider.get_trading_rules(
+            self.config.connector_name, self.config.trading_pair
+        )
+        min_size = rules.min_order_size or Decimal("0")
+        min_notional = rules.min_notional_size or Decimal("0")
+        return [
+            spec for spec in specs
+            if spec.side is not None
+            and spec.price is not None
+            and Decimal(str(spec.amount)) >= min_size
+            and Decimal(str(spec.amount)) * Decimal(str(spec.price)) >= min_notional
         ]
 
     @staticmethod
