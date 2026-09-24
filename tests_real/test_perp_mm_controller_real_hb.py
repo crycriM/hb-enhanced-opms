@@ -234,6 +234,32 @@ def test_quoting_intent_maps_to_limit_maker_order_executor():
     assert by_side[TradeType.SELL].position_action == PositionAction.CLOSE
 
 
+@pytest.mark.parametrize("dust_size", [0.00009999999999998899, 0.001])
+def test_quoting_intent_skips_orders_below_venue_minimums(dust_size):
+    from hummingbot.core.data_type.common import TradeType
+
+    ctrl = _controller()
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid",
+        coin="ETH",
+        account_id="e2_mm1",
+        target_inventory=0.4,
+        current_inventory=0.3999,
+        quote=QuoteSpec(
+            bid_price=2999.0,
+            ask_price=3001.0,
+            bid_size=0.01,
+            ask_size=dust_size,
+        ),
+        urgency="passive",
+    )
+
+    actions = ctrl.determine_executor_actions()
+
+    assert len(actions) == 1
+    assert actions[0].executor_config.side == TradeType.BUY
+
+
 class _ConnectorWithBalance:
     def __init__(self, balances):
         self._balances = balances
