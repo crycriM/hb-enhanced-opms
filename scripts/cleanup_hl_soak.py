@@ -23,8 +23,9 @@ def _exchange(account_id: str, address: str):
     private_key = os.environ.get(f"HYPERLIQUID_{account_id.upper()}_PRIVATE_KEY")
     if not private_key:
         raise SystemExit(f"missing HYPERLIQUID_{account_id.upper()}_PRIVATE_KEY")
-    master = (os.environ.get("HYPERLIQUID_MASTER_ACCOUNT_ADDRESS")
-              or os.environ.get("HYPERLIQUID_E2_MAIN_ACCOUNT_ADDRESS") or "").lower()
+    family = account_id.split("_")[0].upper()  # e3_sub1 -> E3_MAIN is its master
+    master = (os.environ.get(f"HYPERLIQUID_{family}_MAIN_ACCOUNT_ADDRESS")
+              or os.environ.get("HYPERLIQUID_MASTER_ACCOUNT_ADDRESS") or "").lower()
     wallet = Account.from_key(private_key)
     if address == master:
         return Exchange(wallet=wallet, base_url=constants.MAINNET_API_URL)

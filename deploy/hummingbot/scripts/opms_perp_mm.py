@@ -27,6 +27,7 @@ from dotenv import dotenv_values
 import opms
 import scripts.v2_with_controllers as v2  # module alias: HB picks the strategy/config classes via inspect.getmembers
 from opms.connectors.topology import validate_controller_topology
+from opms.controllers.generic.portfolio_stop import PortfolioStopBook
 
 # The monorepo .env (AGENTS.md credential convention). Read, never exported:
 # the HB process has no business holding other accounts' keys in os.environ.
@@ -44,6 +45,16 @@ class OpmsPerpMM(v2.V2WithControllers):
         env = {**dotenv_values(_ENV_FILE), **os.environ}
         for cfg in controller_configs:
             _check_account_routing(cfg, connectors[cfg.connector_name], env)
+        db_path = os.environ.get("OPMS_PORTFOLIO_STOP_DB")
+        members_raw = os.environ.get("OPMS_PORTFOLIO_MEMBERS")
+        if bool(db_path) != bool(members_raw):
+            raise ValueError("set both OPMS_PORTFOLIO_STOP_DB and OPMS_PORTFOLIO_MEMBERS")
+        if db_path:
+            members = {tuple(member.split(":", 1)) for member in members_raw.split(",")}
+            PortfolioStopBook(db_path, members)
+            for cfg in controller_configs:
+                if (cfg.account_id, cfg.coin) not in members:
+                    raise ValueError(f"controller {cfg.id} is missing from OPMS_PORTFOLIO_MEMBERS")
         super().__init__(connectors, config)
 
 

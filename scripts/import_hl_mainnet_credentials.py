@@ -23,7 +23,8 @@ Required env vars:
   HYPERLIQUID_<ACCOUNT_ID>_PRIVATE_KEY
 
 Optional:
-  HYPERLIQUID_MASTER_ACCOUNT_ADDRESS   # auto-detects subaccount -> use_vault (falls back to HYPERLIQUID_E2_MAIN_ACCOUNT_ADDRESS)
+  HYPERLIQUID_<FAMILY>_MAIN_ACCOUNT_ADDRESS  # master of the account's family (e3_sub1 -> E3_MAIN); auto-detects subaccount -> use_vault
+  HYPERLIQUID_MASTER_ACCOUNT_ADDRESS   # fallback master when the family has no _MAIN entry
   HB_USE_VAULT=yes|no                  # explicit override of the auto-detection
 
 Usage (inside the HB env):
@@ -56,7 +57,8 @@ def _resolve(account_id: str, use_vault_override: str | None) -> dict:
     if not os.environ.get("HB_PASSWORD"):
         raise SystemExit("Missing HB_PASSWORD (encrypts the credential store)")
 
-    master = (os.environ.get(MASTER_ADDRESS_VAR) or _account_env("e2_main", "ACCOUNT_ADDRESS") or "").lower()
+    family = account_id.split("_")[0]  # e3_sub1 -> e3_main is its master
+    master = (_account_env(f"{family}_main", "ACCOUNT_ADDRESS") or os.environ.get(MASTER_ADDRESS_VAR) or "").lower()
     if use_vault_override is not None:
         use_vault = use_vault_override.strip().lower() in {"yes", "y", "true", "1"}
     elif master:
@@ -100,7 +102,7 @@ def import_credentials(env: dict) -> None:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--account-id", required=True,
-                    help="e2_main (master) or e2_mm1 / e2_mm2 (subaccounts)")
+                    help="e2_main / e3_main (masters) or e2_mm1 / e3_sub1 (subaccounts)")
     ap.add_argument("--use-vault", choices=["yes", "no"], default=None,
                     help="Override the master/subaccount auto-detection")
     ap.add_argument("--dry-run", action="store_true",

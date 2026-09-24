@@ -27,9 +27,15 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(REPO_ROOT / ".env")
 
-MASTER_ID = "e2_main"
 PAIR = "ETH-USD"
 CONNECTOR_NAME = "hyperliquid_perpetual"
+
+
+def _master_address(account_id: str) -> str:
+    """Master of an account family: ``e3_sub1`` -> ``HYPERLIQUID_E3_MAIN_ACCOUNT_ADDRESS``."""
+    family = account_id.split("_")[0].upper()
+    return (os.environ.get(f"HYPERLIQUID_{family}_MAIN_ACCOUNT_ADDRESS")
+            or os.environ.get("HYPERLIQUID_MASTER_ACCOUNT_ADDRESS") or "").lower()
 
 
 def _resolve_account(account_id: str, use_vault: str | None) -> tuple[str, str, bool]:
@@ -38,11 +44,7 @@ def _resolve_account(account_id: str, use_vault: str | None) -> tuple[str, str, 
     private_key = os.environ.get(f"{prefix}_PRIVATE_KEY")
     if not address or not private_key:
         raise SystemExit(f"Missing {prefix}_ACCOUNT_ADDRESS / _PRIVATE_KEY")
-    master = (
-        os.environ.get("HYPERLIQUID_MASTER_ACCOUNT_ADDRESS")
-        or os.environ.get(f"HYPERLIQUID_{MASTER_ID.upper()}_ACCOUNT_ADDRESS")
-        or ""
-    ).lower()
+    master = _master_address(account_id)
     if use_vault is not None:
         vault = use_vault == "yes"
     elif master:
@@ -83,6 +85,25 @@ async def _wait_ready(connector, timeout_s: float) -> float:
     raise RuntimeError(f"order book for {PAIR} not ready within {timeout_s}s")
 
 
+def _nonce_patch_ok() -> bool:
+    """Two signs under a frozen clock must get distinct nonces (local HB patch)."""
+    import json
+
+    import eth_account
+    from hummingbot.connector.derivative.hyperliquid_perpetual import hyperliquid_perpetual_constants as CONSTANTS
+    from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_auth import (
+        HyperliquidPerpetualAuth,
+    )
+
+    auth = HyperliquidPerpetualAuth("0x" + "11" * 20, eth_account.Account.create().key.hex(), True)
+    now = time.time()
+    auth._get_timestamp = lambda: now
+    cancel = json.dumps({"type": "cancel", "cancels": {"asset": 1, "cloid": "0x" + "00" * 16}})
+    a, b = (json.loads(auth.add_auth_to_params_post(cancel, CONSTANTS.PERPETUAL_BASE_URL))["nonce"]
+            for _ in range(2))
+    return a != b
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--account-id", default="e2_mm1")
@@ -104,6 +125,8 @@ async def main() -> int:
 
     connector = _build_connector(address, private_key, use_vault)
     failures: list[str] = []
+    if not _nonce_patch_ok():
+        failures.append("HL auth reuses a nonce for same-ms signs (local nonce patch missing after HB update?)")
     try:
         await connector._initialize_trading_pair_symbol_map()
         await connector.start_network()

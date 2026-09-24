@@ -54,12 +54,14 @@ class FillObserver:
         venue: str,
         symbol: str,
         markout_horizons: tuple[float, ...] = (10.0, 30.0, 60.0),
+        ledger: PnLLedger | None = None,
+        markout: MarkoutTracker | None = None,
     ):
         self.venue = venue
         self.symbol = symbol
 
-        self._ledger = PnLLedger(venue=venue, symbol=symbol)
-        self._markout = MarkoutTracker(horizons=markout_horizons)
+        self._ledger = ledger if ledger is not None else PnLLedger(venue=venue, symbol=symbol)
+        self._markout = markout if markout is not None else MarkoutTracker(horizons=markout_horizons)
 
         # Slippage tracking: fill_price vs mid_at_fill (bps, signed)
         self._slippage_bps: list[float] = []

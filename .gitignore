@@ -146,4 +146,8 @@ logs/
 project-internal/
 credentials.json
 docs/
-deploy/hummingbot/conf
+deploy/hummingbot/conf/**
+!deploy/hummingbot/conf/scripts/
+!deploy/hummingbot/conf/controllers/
+!deploy/hummingbot/conf/scripts/opms_perp_mm_*_soak.yml
+!deploy/hummingbot/conf/controllers/perp_mm_*_soak.yml

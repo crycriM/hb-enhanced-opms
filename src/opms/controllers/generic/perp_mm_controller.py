@@ -23,7 +23,8 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 from mm_core.contracts import ExecIntent
 from mm_core.inventory import Caps
-from mm_core.risk_policy import RiskConfig
+from mm_core.regime import GateConfig
+from mm_core.risk_policy import Decision, RiskConfig
 
 from perp_bot.config import PerpPairConfig
 from perp_bot.keeper import Keeper
@@ -41,6 +42,7 @@ from .perp_mm_bridge import (
     intent_to_execution_request,
     intent_to_order_specs,
 )
+from .portfolio_stop import PortfolioStopBook
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,8 @@ class PerpMMControllerConfig(ControllerConfigBase):
     # are evaluated relative to this target by perp_bot/mm_core.
     target_inventory: float = 0.0
     leverage: int = 1
+    regime_stop: bool = True
+    toxic_markout_bps: float | None = -1.0
     # The quote/collateral asset label the connector reports balances under.
     # Hummingbot's Hyperliquid connector uses "USD" (CONSTANTS.CURRENCY), not
     # "USDC" — _current_equity also falls back across common labels.
@@ -170,6 +174,8 @@ class PerpMMController(ControllerBase):
             risk=RiskConfig(
                 margin_health_soft=config.margin_health_soft,
                 margin_health_hard=config.margin_health_hard,
+                gate=GateConfig(regime_stop=config.regime_stop),
+                toxic_markout_bps=config.toxic_markout_bps,
             ),
         )
         self._client = InProcessClient()
@@ -183,6 +189,8 @@ class PerpMMController(ControllerBase):
         self._fill_observer = FillObserver(
             venue=config.connector_name,
             symbol=config.trading_pair,
+            ledger=self.keeper._pnl,
+            markout=self.keeper._markout,
         )
         self._settled_executor_ids: set[str] = set()
         self._margin_cache: tuple[float, float] | None = None
@@ -196,6 +204,17 @@ class PerpMMController(ControllerBase):
             recovery_cooldown_s=config.quote_recovery_cooldown,
         )
         self._quote_refresh_pending = False
+        db_path = os.environ.get("OPMS_PORTFOLIO_STOP_DB")
+        members_raw = os.environ.get("OPMS_PORTFOLIO_MEMBERS")
+        if bool(db_path) != bool(members_raw):
+            raise ValueError("set both OPMS_PORTFOLIO_STOP_DB and OPMS_PORTFOLIO_MEMBERS")
+        self._portfolio_stop = None
+        if db_path:
+            members = {tuple(member.split(":", 1)) for member in members_raw.split(",")}
+            self._portfolio_stop = PortfolioStopBook(db_path, members)
+            if (config.account_id, config.coin) not in members:
+                raise ValueError("this controller is not in OPMS_PORTFOLIO_MEMBERS")
+            self.keeper.intent_transform = self._portfolio_transform
 
     def _ensure_resilience_state(self) -> None:
         """Initialise safety state for normal and object.__new__ test paths."""
@@ -267,6 +286,19 @@ class PerpMMController(ControllerBase):
             urgency="emergency",
             strategy_hint="passive_aggressive",
         )
+        self._publish_portfolio_emergency(current)
+
+    def _publish_portfolio_emergency(self, position: float) -> None:
+        book = getattr(self, "_portfolio_stop", None)
+        if book is None:
+            return
+        # Emergency propagation does not use prices to size orders: every
+        # target is zero. A missing feed must not suppress the global stop.
+        mid = getattr(getattr(self, "_fill_observer", None), "_last_mid", None) or 1.0
+        try:
+            book.update(self.config.account_id, self.config.coin, position, mid, "emergency")
+        except Exception:
+            logger.exception("Could not publish portfolio emergency; local flatten remains active")
 
     async def _refresh_positions_after_fills(self) -> None:
         """Re-read venue positions once an executor that traded has finished.
@@ -330,10 +362,11 @@ class PerpMMController(ControllerBase):
 
         self._fill_observer.update_mid(float(mid))
 
+        current_position = float(self._current_base_position())
         self._client.set_positions({
             self.config.coin: Position(
                 coin=self.config.coin,
-                position=float(self._current_base_position()),
+                position=current_position,
                 equity=float(self._current_equity()),
                 margin_available=await self._current_margin_available(),
             )
@@ -345,6 +378,34 @@ class PerpMMController(ControllerBase):
             "funding_rate": funding_rate,
         })
         await self.keeper._tick()
+
+    def _portfolio_transform(
+        self, decision: Decision, intent: ExecIntent | None, position: float, mid: float,
+    ) -> ExecIntent | None:
+        book = getattr(self, "_portfolio_stop", None)
+        if book is None:
+            return intent
+        local_mode = (
+            "emergency" if decision is Decision.EMERGENCY_EXIT else
+            "stop" if decision is Decision.STOP_QUOTING else "quote"
+        )
+        if not self._quote_liveness.allow_quotes(self.market_data_provider.time()):
+            local_mode = "emergency"
+        mode, target = book.update(
+            self.config.account_id, self.config.coin, position, mid, local_mode,
+        )
+        if mode == "quote":
+            return intent
+        return ExecIntent(
+            venue=self.config.venue,
+            coin=self.config.coin,
+            account_id=self.config.account_id,
+            target_inventory=target,
+            current_inventory=position,
+            quote=None,
+            urgency="emergency" if mode == "emergency" else "immediate",
+            strategy_hint="passive_aggressive",
+        )
 
     def _current_base_position(self) -> Decimal:
         # Venue truth from the connector, not HB's `positions_held`: that list
@@ -582,6 +643,7 @@ class PerpMMController(ControllerBase):
                             self.config.trading_pair, sorted(expected), sorted(live),
                         )
                         req = self._quote_failsafe_request(self._client.last_intent)
+                        self._publish_portfolio_emergency(float(self._current_base_position()))
                         # Cancel confirmation precedes the close. A same-batch
                         # close can be mis-sized by a quote that fills while
                         # its executor is still shutting down.

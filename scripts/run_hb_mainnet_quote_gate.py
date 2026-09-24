@@ -42,13 +42,13 @@ from run_hb_mainnet_smoke import (  # noqa: E402  (shared connector/credential p
     CONNECTOR_NAME,
     PAIR,
     _build_connector,
+    _master_address,
     _resolve_account,
     _wait_ready,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MASTER_ID = "e2_main"
-OTHER_ACCOUNT_IDS = ("e2_main", "e2_mm1", "e2_mm2")
+OTHER_ACCOUNT_IDS = ("e2_main", "e2_mm1", "e2_mm2", "e3_main", "e3_sub1")
 
 
 class _DryRunComplete(Exception):
@@ -131,7 +131,9 @@ def _hl_exchange(account_id: str):
 
     prefix = f"HYPERLIQUID_{account_id.upper()}"
     wallet = Account.from_key(os.environ[f"{prefix}_PRIVATE_KEY"])
-    master = os.environ[f"HYPERLIQUID_{MASTER_ID.upper()}_ACCOUNT_ADDRESS"].lower()
+    master = _master_address(account_id)
+    if not master:
+        raise SystemExit(f"missing master address for {account_id}")
     address = os.environ[f"{prefix}_ACCOUNT_ADDRESS"].lower()
     if address == master:
         return Exchange(wallet=wallet, base_url=constants.MAINNET_API_URL)

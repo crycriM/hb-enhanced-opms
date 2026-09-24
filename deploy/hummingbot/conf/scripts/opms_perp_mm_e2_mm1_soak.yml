@@ -1,0 +1,4 @@
+script_file_name: opms_perp_mm.py
+controllers_config:
+  - perp_mm_e2_mm1_eth_soak.yml
+  - perp_mm_e2_mm1_sol_soak.yml

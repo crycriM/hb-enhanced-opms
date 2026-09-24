@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run e2_mm1 and e2_mm2 as two independent real-Hummingbot shadow instances.
+# Run e2_mm1 and e3_sub1 as two independent real-Hummingbot shadow instances.
 # Each instance gets its own Hummingbot checkout copy and encrypted connector
 # store because the HL connector has one credential slot per process.
 set -euo pipefail
@@ -11,6 +11,7 @@ PY="${PY:-/home/christian/miniforge3/envs/hummingbot/bin/python}"
 RUNTIME_BASE="${RUNTIME_BASE:-$(mktemp -d /tmp/dual-hb-shadow.XXXXXX)}"
 ENV_FILE="${OPMS_ENV_FILE:-$REPO/.env}"
 COMMON_PYTHONPATH="$REPO/hb-enhanced-opms/src:$REPO/perp-bot/src:$REPO/mm-core/src"
+PORTFOLIO_MEMBERS="e2_mm1:ETH,e2_mm1:SOL,e3_sub1:ETH,e3_sub1:SOL"
 
 [[ "$DURATION" =~ ^[0-9]+$ ]] || { echo "duration must be an integer" >&2; exit 2; }
 [[ "${OPMS_HB_MAINNET:-}" == "confirm" ]] || {
@@ -32,7 +33,7 @@ COMMON_PYTHONPATH="$REPO/hb-enhanced-opms/src:$REPO/perp-bot/src:$REPO/mm-core/s
   "$PY" scripts/validate_hb_deploy_configs.py)
 
 RUNTIME_A="$RUNTIME_BASE/e2_mm1"
-RUNTIME_B="$RUNTIME_BASE/e2_mm2"
+RUNTIME_B="$RUNTIME_BASE/e3_sub1"
 mkdir -p "$RUNTIME_BASE"
 
 prepare_runtime() {
@@ -75,12 +76,12 @@ import_account() {
 }
 
 import_account "$RUNTIME_A" e2_mm1
-import_account "$RUNTIME_B" e2_mm2
+import_account "$RUNTIME_B" e3_sub1
 
 LOG_A="$REPO/hb-enhanced-opms/logs/hb_shadow/perp_mm_e2_mm1_eth.decisions.jsonl"
 LOG_B="$REPO/hb-enhanced-opms/logs/hb_shadow/perp_mm_e2_mm1_sol.decisions.jsonl"
-LOG_C="$REPO/hb-enhanced-opms/logs/hb_shadow/perp_mm_e2_mm2_eth.decisions.jsonl"
-LOG_D="$REPO/hb-enhanced-opms/logs/hb_shadow/perp_mm_e2_mm2_sol.decisions.jsonl"
+LOG_C="$REPO/hb-enhanced-opms/logs/hb_shadow/perp_mm_e3_sub1_eth.decisions.jsonl"
+LOG_D="$REPO/hb-enhanced-opms/logs/hb_shadow/perp_mm_e3_sub1_sol.decisions.jsonl"
 for log in "$LOG_A" "$LOG_B" "$LOG_C" "$LOG_D"; do
   [[ -f "$log" ]] && mv "$log" "${log%.jsonl}.$(date +%Y%m%dT%H%M%S).jsonl"
 done
@@ -89,8 +90,10 @@ run_instance() {
   local runtime="$1" config="$2" output="$3"
   (cd "$runtime" &&
     OPMS_ENV_FILE="$ENV_FILE" CONFIG_PASSWORD="$PASSWORD" \
+    OPMS_PORTFOLIO_STOP_DB="$RUNTIME_BASE/portfolio_stop.db" \
+    OPMS_PORTFOLIO_MEMBERS="$PORTFOLIO_MEMBERS" \
     SCRIPT_CONFIG="$config" \
-    PYTHONPATH="$runtime:$COMMON_PYTHONPATH" \
+    PYTHONPATH="$runtime/bin:$runtime:$COMMON_PYTHONPATH" \
     timeout --signal=INT --kill-after=30 "$DURATION" \
       "$PY" "$REPO/hb-enhanced-opms/deploy/hummingbot/scripts/run_hummingbot_isolated.py" \
       >"$output" 2>&1) &
@@ -100,7 +103,7 @@ OUT_A="$RUNTIME_A/launcher.log"
 OUT_B="$RUNTIME_B/launcher.log"
 run_instance "$RUNTIME_A" opms_perp_mm_e2_mm1_shadow.yml "$OUT_A"
 PID_A=$!
-run_instance "$RUNTIME_B" opms_perp_mm_e2_mm2_shadow.yml "$OUT_B"
+run_instance "$RUNTIME_B" opms_perp_mm_e3_sub1_shadow.yml "$OUT_B"
 PID_B=$!
 
 set +e
@@ -111,7 +114,7 @@ set -e
 if [[ ! -s "$LOG_A" || ! -s "$LOG_B" || ! -s "$LOG_C" || ! -s "$LOG_D" ]]; then
   echo "dual shadow did not produce all four decision logs" >&2
   echo "e2_mm1 launcher: $OUT_A" >&2
-  echo "e2_mm2 launcher: $OUT_B" >&2
+  echo "e3_sub1 launcher: $OUT_B" >&2
   exit 1
 fi
 for output in "$OUT_A" "$OUT_B"; do
@@ -132,11 +135,11 @@ is_expected_stop() {
   [[ "$1" -eq 0 || "$1" -eq 124 || "$1" -eq 130 || "$1" -eq 143 ]]
 }
 if ! is_expected_stop "$STATUS_A" || ! is_expected_stop "$STATUS_B"; then
-  echo "dual shadow launcher failed: e2_mm1=$STATUS_A e2_mm2=$STATUS_B" >&2
+  echo "dual shadow launcher failed: e2_mm1=$STATUS_A e3_sub1=$STATUS_B" >&2
   echo "e2_mm1 launcher: $OUT_A" >&2
-  echo "e2_mm2 launcher: $OUT_B" >&2
+  echo "e3_sub1 launcher: $OUT_B" >&2
   exit 1
 fi
 
-echo "dual shadow passed: e2_mm1 and e2_mm2 ran concurrently for ${DURATION}s"
+echo "dual shadow passed: e2_mm1 and e3_sub1 ran concurrently for ${DURATION}s"
 echo "launcher logs: $OUT_A $OUT_B"

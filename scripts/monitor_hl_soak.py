@@ -24,6 +24,11 @@ def _alive(pid: int) -> bool:
         return False
 
 
+def _drawdown_breached(equity: float, peak_equity: float, limit_pct: float | None) -> bool:
+    return (limit_pct is not None and peak_equity > 0
+            and (peak_equity - equity) / peak_equity * 100 > limit_pct)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--account-id", default="e2_mm1")
@@ -33,8 +38,11 @@ def main(argv=None) -> int:
     ap.add_argument("--leverage", type=float, default=6.0)
     ap.add_argument("--min-margin-health-ratio", type=float, default=0.15)
     ap.add_argument("--max-initial-margin-ratio", type=float, default=0.85)
+    ap.add_argument("--max-drawdown-pct", type=float)
     ap.add_argument("--output", required=True)
     args = ap.parse_args(argv)
+    if args.max_drawdown_pct is not None and not 0 < args.max_drawdown_pct <= 100:
+        ap.error("--max-drawdown-pct must be in (0, 100]")
 
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
@@ -48,6 +56,7 @@ def main(argv=None) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + args.duration + 90.0
     consecutive_errors = 0
+    peak_equity = 0.0
 
     with output.open("w") as stream:
         while _alive(args.pid) and time.time() < deadline:
@@ -58,6 +67,7 @@ def main(argv=None) -> int:
                 spot_usdc = next((b for b in spot.get("balances", [])
                                   if b.get("coin") == "USDC"), {})
                 equity = float(spot_usdc.get("total") or 0.0)
+                peak_equity = max(peak_equity, equity)
                 available = dict((int(token), value)
                                  for token, value in spot.get("tokenToAvailableAfterMaintenance", []))
                 margin_available = float(available.get(0) or 0.0)
@@ -102,6 +112,10 @@ def main(argv=None) -> int:
                 elif initial_margin_ratio > args.max_initial_margin_ratio:
                     breach = (f"initial margin ratio {initial_margin_ratio:.3f} > "
                               f"{args.max_initial_margin_ratio:.3f}")
+                elif _drawdown_breached(equity, peak_equity, args.max_drawdown_pct):
+                    breach = (f"equity drawdown "
+                              f"{(peak_equity - equity) / peak_equity * 100:.2f}% > "
+                              f"{args.max_drawdown_pct:.2f}%")
                 if breach:
                     event = {"ts": time.time(), "event": "risk_breach", "reason": breach}
                     stream.write(json.dumps(event) + "\n")

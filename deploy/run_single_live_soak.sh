@@ -4,6 +4,8 @@
 # This is an explicitly gated mainnet write.  It uses a disposable HB runtime,
 # imports only e2_mm1 into that runtime, monitors account margin read-only, then
 # cancels and flattens the scoped ETH/SOL state before returning.
+# Diagnostic only: a single-account run cannot exercise the two-account
+# zero-net-USDC STOP_QUOTING target. It can still exercise emergency exits.
 set -euo pipefail
 
 DURATION="${1:-1800}"
@@ -13,6 +15,7 @@ PY="${PY:-/home/christian/miniforge3/envs/hummingbot/bin/python}"
 ENV_FILE="${OPMS_ENV_FILE:-$REPO/.env}"
 ACCOUNT_ID=e2_mm1
 MIN_COLLATERAL="${MIN_COLLATERAL:-600}"
+MAX_DRAWDOWN_PCT="${MAX_DRAWDOWN_PCT:-1.0}"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$REPO/hb-enhanced-opms/logs/live_soak_${STAMP}}"
 COMMON_PYTHONPATH="$REPO/hb-enhanced-opms/src:$REPO/perp-bot/src:$REPO/mm-core/src"
@@ -101,6 +104,7 @@ fi
 )
 
 if [[ "${OPMS_HB_DRY_RUN:-}" == "1" ]]; then
+  echo "warning: single-account diagnostic; cross-account USDC-flat stop is unavailable" >&2
   echo "live soak dry-run passed: runtime prepared and config validated; no Hummingbot process started"
   exit 0
 fi
@@ -109,12 +113,13 @@ LOG_ETH="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_eth_soak.decisions.j
 LOG_SOL="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_sol_soak.decisions.jsonl"
 mkdir -p "$(dirname "$LOG_ETH")"
 
+echo "warning: single-account diagnostic; cross-account USDC-flat stop is unavailable" >&2
 echo "starting e2_mm1 live soak: duration=${DURATION}s artifact_dir=$ARTIFACT_DIR"
 (
   cd "$RUNTIME"
   exec env OPMS_ENV_FILE="$ENV_FILE" CONFIG_PASSWORD="$PASSWORD" \
     SCRIPT_CONFIG=opms_perp_mm_e2_mm1_soak.yml \
-    PYTHONPATH="$RUNTIME:$COMMON_PYTHONPATH" \
+    PYTHONPATH="$RUNTIME/bin:$RUNTIME:$COMMON_PYTHONPATH" \
     timeout --signal=INT --kill-after=60 "$DURATION" \
       "$PY" "$REPO/hb-enhanced-opms/deploy/hummingbot/scripts/run_hummingbot_isolated.py"
 ) >"$ARTIFACT_DIR/launcher.log" 2>&1 &
@@ -123,6 +128,7 @@ HB_PID=$!
 set +e
 "$PY" "$REPO/hb-enhanced-opms/scripts/monitor_hl_soak.py" \
   --account-id "$ACCOUNT_ID" --pid "$HB_PID" --duration "$DURATION" \
+  --max-drawdown-pct "$MAX_DRAWDOWN_PCT" \
   --output "$ARTIFACT_DIR/monitor.jsonl" >"$ARTIFACT_DIR/monitor.log" 2>&1 &
 MON_PID=$!
 wait "$HB_PID"

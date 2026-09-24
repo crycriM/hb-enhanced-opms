@@ -12,7 +12,12 @@ import pytest
 
 # conftest.py already injected HB stubs before this file is loaded.
 from conftest import TradeType, MarketEvent  # shared stubs
+from mm_core.inventory import Caps
+from perp_bot.config import PerpPairConfig
+from perp_bot.keeper import Keeper
+from perp_bot.opms_client import Position
 from opms.analytics.fill_observer import FillObserver
+from opms.controllers.generic.perp_mm_bridge import InProcessClient
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +69,28 @@ class TestFillObserverLifecycle:
 
 
 class TestFillObserverFillAccounting:
+    @pytest.mark.asyncio
+    async def test_shared_keeper_ledger_receives_real_fill_and_fee(self):
+        keeper = Keeper(
+            client=InProcessClient(),
+            config=PerpPairConfig(coin="SOL", gamma=1.0, kappa=0.5,
+                                  caps=Caps(max_position=10.0, critical_position=20.0)),
+        )
+        await keeper._on_snapshot({"ts": time.time(), "mid": 100.0})
+        observer = FillObserver(venue="hl", symbol="SOL-PERP",
+                                ledger=keeper._pnl, markout=keeper._markout)
+        observer.update_mid(100.0)
+        event = _make_fill_event("ord1", "SOL-PERP", "buy", 100.0, 1.0)
+        event.trade_fee.flat_fees = [MagicMock(amount=Decimal("0.015"))]
+        observer._on_fill_event(0, None, event)
+        keeper._apply_positions({"SOL": Position(
+            coin="SOL", position=1.0, equity=100.0, margin_available=100.0,
+        )})
+        assert len(keeper._pnl.fills) == 1  # no synthetic mid-price reconciliation
+        assert keeper._pnl.explain(ts=time.time(), mid=100.0).fee_pnl == pytest.approx(-0.015)
+        assert observer._markout is keeper._markout
+        assert keeper._markout._pending
+
     def _observer_with_fill(self, side: str, price: float, size: float, mid: float):
         observer = FillObserver(venue="hl", symbol="SOL-PERP")
         # Prime the mid so spread_capture is computed.

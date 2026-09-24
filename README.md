@@ -121,11 +121,19 @@ python -c "import hummingbot.connector.connector_base as cb; print(cb.__file__)"
 python -m pytest tests_real/ -q     # real-HB tests, no stubs
 ```
 
-⚠ **Local patch to the pinned checkout.** The HL WS funding parser
-(`hyperliquid_perpetual_api_order_book_data_source.py::_parse_funding_info_message`)
-is patched locally to read only `ctx.get("funding", "0")`. **Re-apply after
-any Hummingbot update** — `scripts/run_hb_mainnet_smoke.py` catches the
-regression if it's missing. See [`status.md`](status.md) for why.
+⚠ **Local patches to the pinned checkout.** **Re-apply both after any
+Hummingbot update** — `scripts/run_hb_mainnet_smoke.py` catches either
+regression if it's missing.
+
+- The HL WS funding parser
+  (`hyperliquid_perpetual_api_order_book_data_source.py::_parse_funding_info_message`)
+  reads only `ctx.get("funding", "0")`. See [`status.md`](status.md) for why.
+- HL auth (`hyperliquid_perpetual_auth.py::_next_nonce`) signs with a strictly
+  increasing nonce instead of the raw ms timestamp, which repeats for
+  back-to-back signs (~0.3 ms each) and gets the second request rejected.
+  Processes sharing one signing key must set `HL_NONCE_STEP=<n processes>` and
+  a distinct `HL_NONCE_SLOT=0..n-1` each; one API wallet per process avoids
+  that. `tests_real/test_hl_nonce_patch.py` covers it.
 
 Notes:
 
@@ -172,8 +180,11 @@ subaccount-auth mechanics and the rule to use an **agent-wallet** key for
 
 **Mainnet subaccount routing.** `scripts/import_hl_mainnet_credentials.py`
 imports either the master (`use_vault=False`) or a subaccount
-(`use_vault=True`, `address=<subaccount>`, secret = the *same* master-approved
-agent key), auto-detecting which from `HYPERLIQUID_MASTER_ACCOUNT_ADDRESS`.
+(`use_vault=True`, `address=<subaccount>`, secret = an agent key approved by
+that subaccount's master), auto-detecting which from the account family's
+master `HYPERLIQUID_<FAMILY>_MAIN_ACCOUNT_ADDRESS` (`e3_sub1` → `E3_MAIN`;
+falls back to `HYPERLIQUID_MASTER_ACCOUNT_ADDRESS`). HL tracks nonces per
+signer, so accounts run concurrently need distinct agent keys.
 HB's connector then signs every request with `vaultAddress=<subaccount>`
 (`HyperliquidPerpetualAuth._vault_address`). ⚠ Hummingbot keys credentials by
 **connector name**, and there is only one `hyperliquid_perpetual` slot — so a
@@ -331,13 +342,36 @@ scoped state before verifying a flat account. The runner requires both
 deploy runners use `run_hummingbot_isolated.py`, which starts the real
 trading core headlessly with MQTT disabled and still performs normal
 strategy/order shutdown on `SIGINT`/`SIGTERM`. See
-[`status.md`](status.md) for the latest soak result before relying on the
+[`project-internal/status.md`](project-internal/status.md) for the latest soak result before relying on the
 behavioral safety gate.
 
 ```bash
 OPMS_HB_MAINNET=confirm OPMS_HB_PLACE_ORDERS=confirm \
   deploy/run_single_live_soak.sh 1800
 ```
+
+The one-hour dual-account soak is prepared at
+`deploy/run_dual_live_soak.sh`. It runs `e2_mm1` and `e3_sub1` (subaccounts of
+two HL master accounts, one agent signer each) in separate
+disposable Hummingbot runtimes, with opposite ETH/SOL tilts and one shared
+portfolio-stop database. It refuses to launch unless both accounts have
+distinct agent signers, clean ETH/SOL state, at least 300 USDC each, and
+explicit mainnet/order confirmation. Each account has an independent margin
+and drawdown monitor. At the deadline or on an early failure, the runner stops
+both instances, cancels scoped orders, closes scoped positions, and checks
+both accounts are flat. Logs and preflight/cleanup snapshots go to
+`logs/live_dual_soak_<timestamp>/`. The collateral threshold defaults to
+300 USDC per account (`MIN_COLLATERAL`).
+
+```bash
+OPMS_HB_MAINNET=confirm OPMS_HB_PLACE_ORDERS=confirm \
+  deploy/run_dual_live_soak.sh 3600
+```
+
+`OPMS_HB_DRY_RUN=1` performs the same credential, account-state, and config
+preflight without starting Hummingbot. The 2026-09-16 single-account soak's
+behavioral safety gate remains pending a live rerun; see
+`project-internal/status.md` before using the dual-account runner.
 
 One-time: choose an HB password, put `HB_PASSWORD=...` in the monorepo `.env`,
 then `python scripts/import_hl_mainnet_credentials.py --account-id <account-id>`.

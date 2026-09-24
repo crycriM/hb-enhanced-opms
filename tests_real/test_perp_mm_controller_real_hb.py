@@ -20,6 +20,7 @@ pytest.importorskip("hummingbot.strategy_v2.executors.executor_orchestrator")
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator  # noqa: E402
 
 from mm_core.contracts import ExecIntent, QuoteSpec  # noqa: E402
+from mm_core.risk_policy import Decision  # noqa: E402
 
 from opms.controllers.generic.perp_mm_bridge import ExecutionRequest, InProcessClient  # noqa: E402
 from opms.controllers.generic.perp_mm_controller import (  # noqa: E402
@@ -27,6 +28,41 @@ from opms.controllers.generic.perp_mm_controller import (  # noqa: E402
     PerpMMControllerConfig,
 )
 from opms.executors.passive_aggressive_executor import PassiveAggressiveExecutorConfig  # noqa: E402
+from opms.controllers.generic.portfolio_stop import PortfolioStopBook  # noqa: E402
+
+
+def test_controller_overrides_quote_with_shared_basket_stop(tmp_path):
+    from types import SimpleNamespace
+
+    members = {("e2_mm1", "ETH"), ("e2_mm1", "SOL"),
+               ("e2_mm2", "ETH"), ("e2_mm2", "SOL")}
+    book = PortfolioStopBook(str(tmp_path / "portfolio.db"), members)
+    book.update("e2_mm1", "ETH", 0.4, 3000, "stop")
+    book.update("e2_mm1", "SOL", -4, 100, "quote")
+    book.update("e2_mm2", "ETH", -0.3, 3000, "quote")
+    book.update("e2_mm2", "SOL", 2, 100, "stop")
+    ctrl = _controller()
+    ctrl.config = _config(account_id="e2_mm1", trading_pair="ETH-USD")
+    ctrl._portfolio_stop = book
+    ctrl._quote_liveness = SimpleNamespace(allow_quotes=lambda now: True)
+    intent = ctrl._portfolio_transform(Decision.QUOTE, None, 0.4, 3000.0)
+    assert intent.quote is None
+    assert intent.current_inventory == 0.4
+    assert intent.target_inventory == pytest.approx(0.4 - 100 / 3000)
+    assert intent.urgency == "immediate"
+
+
+def test_controller_installs_portfolio_hook(tmp_path, monkeypatch):
+    import asyncio
+
+    monkeypatch.setenv("OPMS_PORTFOLIO_STOP_DB", str(tmp_path / "portfolio.db"))
+    monkeypatch.setenv(
+        "OPMS_PORTFOLIO_MEMBERS", "e2_mm1:ETH,e2_mm1:SOL,e2_mm2:ETH,e2_mm2:SOL",
+    )
+    ctrl = PerpMMController(
+        _config(), _MarketDataWithSpot(_ConnectorWithSpotState(_spot_state())), asyncio.Queue()
+    )
+    assert ctrl.keeper.intent_transform.__self__ is ctrl
 
 
 class _MarketData:
@@ -509,6 +545,14 @@ def test_controller_passes_structural_tilt_to_keeper():
 def test_controller_passes_leverage_to_keeper():
     ctrl = _hb_constructed(leverage=6)
     assert ctrl.keeper.config.leverage == 6
+
+
+def test_controller_shares_fill_accounting_and_can_disable_regime_gate():
+    ctrl = _hb_constructed(regime_stop=False)
+    assert ctrl._fill_observer._ledger is ctrl.keeper._pnl
+    assert ctrl._fill_observer._markout is ctrl.keeper._markout
+    assert ctrl.keeper._risk.cfg.gate.regime_stop is False
+    assert ctrl.keeper._risk.cfg.max_drawdown_pct == 10.0
 
 
 def test_shadow_mode_decides_but_emits_no_executor_actions():

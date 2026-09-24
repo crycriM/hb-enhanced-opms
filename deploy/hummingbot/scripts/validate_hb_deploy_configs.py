@@ -36,11 +36,11 @@ def main() -> int:
     env = {**dotenv_values(env_file), **os.environ}
     configs = (
         "opms_perp_mm_e2_mm1_shadow.yml",
-        "opms_perp_mm_e2_mm2_shadow.yml",
+        "opms_perp_mm_e3_sub1_shadow.yml",
     )
     expected_targets = {
         "e2_mm1": {"ETH-USD": 0.4, "SOL-USD": -4.0},
-        "e2_mm2": {"ETH-USD": -0.4, "SOL-USD": 4.0},
+        "e3_sub1": {"ETH-USD": -0.4, "SOL-USD": 4.0},
     }
     expected_leverage = 6
     loaded = []
@@ -72,11 +72,11 @@ def main() -> int:
 
     if {c.id for c in loaded} != {
         "perp_mm_e2_mm1_eth", "perp_mm_e2_mm1_sol",
-        "perp_mm_e2_mm2_eth", "perp_mm_e2_mm2_sol",
+        "perp_mm_e3_sub1_eth", "perp_mm_e3_sub1_sol",
     }:
         raise ValueError("controller ids are not unique across the two instances")
     if len(account_addresses) != 2 or len(set(account_addresses.values())) != 2:
-        raise ValueError("e2_mm1 and e2_mm2 must use distinct HL account addresses")
+        raise ValueError("e2_mm1 and e3_sub1 must use distinct HL account addresses")
     print("dual deploy config validation passed (no network, no orders)")
     return 0
 

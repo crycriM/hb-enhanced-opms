@@ -61,6 +61,15 @@ class InProcessClient:
 
     def set_positions(self, positions: dict[str, Position]) -> None:
         self._positions = positions
+        intent = self.last_intent
+        position = positions.get(intent.coin) if intent is not None else None
+        if (
+            intent is not None
+            and intent.quote is None
+            and position is not None
+            and abs(position.position) < 1e-12
+        ):
+            self.last_intent = None
 
     async def start(self):
         return self

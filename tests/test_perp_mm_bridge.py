@@ -292,3 +292,24 @@ def test_intent_to_execution_request_quote_present():
     intent = ExecIntent(venue="hl", coin="BTC", target_inventory=0.0,
                          quote=QuoteSpec(bid_price=99.0, ask_price=101.0, bid_size=1.0, ask_size=1.0))
     assert intent_to_execution_request(intent) is None
+
+
+def test_flat_position_retires_stale_non_quoting_intent():
+    from mm_core.contracts import ExecIntent
+
+    client = InProcessClient()
+    intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", target_inventory=0.0,
+        current_inventory=0.4, quote=None, urgency="immediate",
+    )
+    client.last_intent = intent
+
+    client.set_positions({
+        "ETH": Position(coin="ETH", position=0.4, equity=700.0),
+    })
+    assert client.last_intent is intent
+
+    client.set_positions({
+        "ETH": Position(coin="ETH", position=0.0, equity=700.0),
+    })
+    assert client.last_intent is None
