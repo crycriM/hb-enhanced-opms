@@ -678,6 +678,23 @@ def test_base_position_nets_all_legs_when_side_unset():
     assert ctrl._current_base_position() == Decimal("1")
 
 
+def test_recent_fill_position_caps_quotes_while_connector_cache_lags():
+    """A partial fill must not be erased by HL's stale position cache.
+
+    Live, the fill ledger reached -0.5 while the connector still reported the
+    -0.4 target; trusting the cache reopened the sell side and breached the
+    account's initial-margin guard.
+    """
+    import time
+    from types import SimpleNamespace
+
+    ctrl = _controller(_MarketData(positions=[_position("-0.4")]))
+    ctrl.config = _config(target_inventory=-0.4)
+    ctrl._fill_observer = SimpleNamespace(position=-0.5, last_fill_ts=time.time())
+
+    assert ctrl._position_for_decision() == pytest.approx(-0.5)
+
+
 def test_growing_de_risk_need_tops_up_instead_of_being_dropped():
     """Review #4: dedup keyed only on (type, side, time_limit) silently drops a
     larger follow-up de-risk on an already-running executor."""
