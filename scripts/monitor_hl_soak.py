@@ -29,10 +29,60 @@ def _drawdown_breached(equity: float, peak_equity: float, limit_pct: float | Non
             and (peak_equity - equity) / peak_equity * 100 > limit_pct)
 
 
+def _portfolio_drawdown_breached(
+    equities: list[float], peak_equity: float, limit_pct: float | None,
+) -> bool:
+    return _drawdown_breached(sum(equities), peak_equity, limit_pct)
+
+
+def _signal_all(pids: list[int]) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+
+
+def _account_sample(info, account_id: str, address: str, mids: dict, leverage: float) -> dict:
+    state = info.user_state(address)
+    spot = info.spot_user_state(address)
+    spot_usdc = next((b for b in spot.get("balances", []) if b.get("coin") == "USDC"), {})
+    equity = float(spot_usdc.get("total") or 0.0)
+    available = dict((int(token), value)
+                     for token, value in spot.get("tokenToAvailableAfterMaintenance", []))
+    margin_available = float(available.get(0) or 0.0)
+    positions = []
+    gross_notional = 0.0
+    for entry in state.get("assetPositions", []):
+        position = entry.get("position", {})
+        coin = position.get("coin")
+        if coin not in {"ETH", "SOL"}:
+            continue
+        szi = float(position.get("szi", 0.0))
+        if abs(szi) <= 1e-12:
+            continue
+        mid = float(mids.get(coin, 0.0) or 0.0)
+        gross_notional += abs(szi) * mid
+        positions.append({"coin": coin, "szi": szi, "mid": mid})
+    initial_margin = gross_notional / leverage
+    return {
+        "account_id": account_id,
+        "equity": equity,
+        "margin_available": margin_available,
+        "margin_health_ratio": margin_available / equity if equity > 0 else 0.0,
+        "gross_notional": gross_notional,
+        "initial_margin": initial_margin,
+        "initial_margin_ratio": initial_margin / equity if equity > 0 else 1.0,
+        "open_orders": len([o for o in info.open_orders(address)
+                            if o.get("coin") in {"ETH", "SOL"}]),
+        "positions": positions,
+    }
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--account-id", default="e2_mm1")
-    ap.add_argument("--pid", type=int, required=True)
+    ap.add_argument("--account-id", dest="account_ids", action="append")
+    ap.add_argument("--pid", dest="pids", action="append", type=int, required=True)
     ap.add_argument("--duration", type=float, required=True)
     ap.add_argument("--interval", type=float, default=5.0)
     ap.add_argument("--leverage", type=float, default=6.0)
@@ -43,15 +93,24 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.max_drawdown_pct is not None and not 0 < args.max_drawdown_pct <= 100:
         ap.error("--max-drawdown-pct must be in (0, 100]")
+    account_ids = args.account_ids or ["e2_mm1"]
+    if len(account_ids) != len(args.pids):
+        ap.error("repeat --account-id and --pid once per monitored account")
+    if len(set(account_ids)) != len(account_ids):
+        ap.error("--account-id values must be distinct")
 
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
 
-    address, is_testnet = resolve_account(args.account_id)
-    if str(is_testnet).lower() != "false":
-        raise SystemExit("monitor refuses a non-mainnet credential environment")
+    accounts = []
+    for account_id in account_ids:
+        address, is_testnet = resolve_account(account_id)
+        if str(is_testnet).lower() != "false":
+            raise SystemExit("monitor refuses a non-mainnet credential environment")
+        accounts.append((account_id, address))
+    if len({str(address).lower() for _, address in accounts}) != len(accounts):
+        raise SystemExit("monitor refuses duplicate account addresses")
     info = Info(constants.MAINNET_API_URL, skip_ws=True)
-    coins = {"ETH", "SOL"}
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + args.duration + 90.0
@@ -59,61 +118,45 @@ def main(argv=None) -> int:
     peak_equity = 0.0
 
     with output.open("w") as stream:
-        while _alive(args.pid) and time.time() < deadline:
+        while all(_alive(pid) for pid in args.pids) and time.time() < deadline:
             try:
-                state = info.user_state(address)
-                spot = info.spot_user_state(address)
                 mids = info.all_mids()
-                spot_usdc = next((b for b in spot.get("balances", [])
-                                  if b.get("coin") == "USDC"), {})
-                equity = float(spot_usdc.get("total") or 0.0)
+                account_samples = [
+                    _account_sample(info, account_id, address, mids, args.leverage)
+                    for account_id, address in accounts
+                ]
+                equities = [sample["equity"] for sample in account_samples]
+                equity = sum(equities)
                 peak_equity = max(peak_equity, equity)
-                available = dict((int(token), value)
-                                 for token, value in spot.get("tokenToAvailableAfterMaintenance", []))
-                margin_available = float(available.get(0) or 0.0)
-                positions = []
-                gross_notional = 0.0
-                for entry in state.get("assetPositions", []):
-                    position = entry.get("position", {})
-                    coin = position.get("coin")
-                    if coin not in coins:
-                        continue
-                    szi = float(position.get("szi", 0.0))
-                    if abs(szi) <= 1e-12:
-                        continue
-                    mid = float(mids.get(coin, 0.0) or 0.0)
-                    gross_notional += abs(szi) * mid
-                    positions.append({"coin": coin, "szi": szi, "mid": mid})
-                open_orders = [o for o in info.open_orders(address) if o.get("coin") in coins]
-                initial_margin = gross_notional / args.leverage
-                health_ratio = margin_available / equity if equity > 0 else 0.0
-                initial_margin_ratio = initial_margin / equity if equity > 0 else 1.0
                 sample = {
                     "ts": time.time(),
                     "equity": equity,
-                    "margin_available": margin_available,
-                    "margin_health_ratio": health_ratio,
-                    "gross_notional": gross_notional,
-                    "initial_margin": initial_margin,
-                    "initial_margin_ratio": initial_margin_ratio,
-                    "open_orders": len(open_orders),
-                    "positions": positions,
+                    "peak_equity": peak_equity,
+                    "accounts": account_samples,
                 }
                 stream.write(json.dumps(sample) + "\n")
                 stream.flush()
                 print(json.dumps(sample), flush=True)
                 consecutive_errors = 0
                 breach = None
-                if equity <= 0:
-                    breach = "equity is zero or unavailable"
-                elif health_ratio < args.min_margin_health_ratio:
-                    breach = (f"margin health {health_ratio:.3f} < "
-                              f"{args.min_margin_health_ratio:.3f}")
-                elif initial_margin_ratio > args.max_initial_margin_ratio:
-                    breach = (f"initial margin ratio {initial_margin_ratio:.3f} > "
-                              f"{args.max_initial_margin_ratio:.3f}")
-                elif _drawdown_breached(equity, peak_equity, args.max_drawdown_pct):
-                    breach = (f"equity drawdown "
+                for account in account_samples:
+                    account_id = account["account_id"]
+                    if account["equity"] <= 0:
+                        breach = f"{account_id} equity is zero or unavailable"
+                    elif account["margin_health_ratio"] < args.min_margin_health_ratio:
+                        breach = (f"{account_id} margin health "
+                                  f"{account['margin_health_ratio']:.3f} < "
+                                  f"{args.min_margin_health_ratio:.3f}")
+                    elif account["initial_margin_ratio"] > args.max_initial_margin_ratio:
+                        breach = (f"{account_id} initial margin ratio "
+                                  f"{account['initial_margin_ratio']:.3f} > "
+                                  f"{args.max_initial_margin_ratio:.3f}")
+                    if breach:
+                        break
+                if not breach and _portfolio_drawdown_breached(
+                    equities, peak_equity, args.max_drawdown_pct,
+                ):
+                    breach = (f"portfolio equity drawdown "
                               f"{(peak_equity - equity) / peak_equity * 100:.2f}% > "
                               f"{args.max_drawdown_pct:.2f}%")
                 if breach:
@@ -121,10 +164,7 @@ def main(argv=None) -> int:
                     stream.write(json.dumps(event) + "\n")
                     stream.flush()
                     print(json.dumps(event), flush=True)
-                    try:
-                        os.kill(args.pid, signal.SIGINT)
-                    except ProcessLookupError:
-                        pass
+                    _signal_all(args.pids)
                     return 1
             except Exception as exc:  # fail closed after repeated read failures
                 consecutive_errors += 1
@@ -135,17 +175,11 @@ def main(argv=None) -> int:
                 stream.flush()
                 print(json.dumps(event), flush=True)
                 if consecutive_errors >= 3:
-                    try:
-                        os.kill(args.pid, signal.SIGINT)
-                    except ProcessLookupError:
-                        pass
+                    _signal_all(args.pids)
                     return 1
             time.sleep(args.interval)
-    if time.time() >= deadline and _alive(args.pid):
-        try:
-            os.kill(args.pid, signal.SIGINT)
-        except ProcessLookupError:
-            pass
+    if time.time() >= deadline and any(_alive(pid) for pid in args.pids):
+        _signal_all(args.pids)
         return 1
     return 0
 

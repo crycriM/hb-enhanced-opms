@@ -63,7 +63,8 @@ done
 RUNTIME_BASE="$(mktemp -d /tmp/hb-dual-live-soak.XXXXXX)"
 STARTED=0
 COMPLETED=0
-declare -A HB_PID MON_PID
+MON_PID=""
+declare -A HB_PID
 
 finish() {
   local status=$? account coin log hb_status mon_status cleanup_status post_status
@@ -83,15 +84,15 @@ finish() {
         status=1
       fi
     fi
-    if [[ -n "${MON_PID[$account]:-}" ]]; then
-      wait "${MON_PID[$account]}"
-      mon_status=$?
-      if [[ "$mon_status" -ne 0 ]]; then
-        echo "$account monitor exit status: $mon_status" >&2
-        status=1
-      fi
-    fi
   done
+  if [[ -n "$MON_PID" ]]; then
+    wait "$MON_PID"
+    mon_status=$?
+    if [[ "$mon_status" -ne 0 ]]; then
+      echo "combined monitor exit status: $mon_status" >&2
+      status=1
+    fi
+  fi
   if [[ "$STARTED" -eq 1 ]]; then
     for account in "${ACCOUNTS[@]}"; do
       "$PY" "$REPO/hb-enhanced-opms/scripts/cleanup_hl_soak.py" \
@@ -200,22 +201,26 @@ echo "starting dual live soak: duration=${DURATION}s artifact_dir=$ARTIFACT_DIR"
 STARTED=1
 for account in "${ACCOUNTS[@]}"; do
   run_instance "$account"
-  "$PY" "$REPO/hb-enhanced-opms/scripts/monitor_hl_soak.py" \
-    --account-id "$account" --pid "${HB_PID[$account]}" --duration "$DURATION" \
-    --max-drawdown-pct "$MAX_DRAWDOWN_PCT" \
-    --output "$ARTIFACT_DIR/${account}_monitor.jsonl" \
-    >"$ARTIFACT_DIR/${account}_monitor.log" 2>&1 &
-  MON_PID[$account]=$!
 done
+"$PY" "$REPO/hb-enhanced-opms/scripts/monitor_hl_soak.py" \
+  --account-id e2_mm1 --pid "${HB_PID[e2_mm1]}" \
+  --account-id e3_sub1 --pid "${HB_PID[e3_sub1]}" \
+  --duration "$DURATION" --max-drawdown-pct "$MAX_DRAWDOWN_PCT" \
+  --output "$ARTIFACT_DIR/combined_monitor.jsonl" \
+  >"$ARTIFACT_DIR/combined_monitor.log" 2>&1 &
+MON_PID=$!
 
 start_ts=$(date +%s)
 deadline=$((start_ts + DURATION))
 startup_checked=0
 while (( $(date +%s) < deadline )); do
+  if ! kill -0 "$MON_PID" 2>/dev/null; then
+    echo "combined monitor stopped before the soak deadline" >&2
+    exit 1
+  fi
   for account in "${ACCOUNTS[@]}"; do
-    if ! kill -0 "${HB_PID[$account]}" 2>/dev/null || \
-       ! kill -0 "${MON_PID[$account]}" 2>/dev/null; then
-      echo "$account launcher or monitor stopped before the soak deadline" >&2
+    if ! kill -0 "${HB_PID[$account]}" 2>/dev/null; then
+      echo "$account launcher stopped before the soak deadline" >&2
       exit 1
     fi
   done
