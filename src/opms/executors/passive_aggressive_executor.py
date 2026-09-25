@@ -420,6 +420,19 @@ class PassiveAggressiveExecutor(ExecutorBase):
         if not self._is_our_order(event.order_id):
             return
         child = self._active_child()
+        error_message = str(getattr(event, "error_message", "") or "").lower()
+        if (
+            self.config.position_action == PositionAction.CLOSE
+            and "reduce only order would increase position" in error_message
+        ):
+            child.tracked_order = None
+            child.status = _ChildStatus.SKIPPED
+            logger.info(
+                "PA close is already satisfied at the venue; stopping after "
+                f"terminal reduce-only rejection [{event.order_id}]"
+            )
+            self.close_execution_by(CloseType.EARLY_STOP)
+            return
         was_aggressive = child.status == _ChildStatus.AGGRESSIVE
         child.status = _ChildStatus.IDLE
         child.tracked_order = None

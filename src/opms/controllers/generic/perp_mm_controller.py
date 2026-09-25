@@ -447,19 +447,18 @@ class PerpMMController(ControllerBase):
         return total
 
     def _position_for_decision(self) -> float:
-        """Keep recent fills from being erased by HL's lagging position cache."""
+        """Keep recent fills from being erased by HL's lagging position cache.
+
+        FillObserver and Keeper share the same reconciled PnL ledger, so after
+        a local fill its position is the freshest absolute position, including
+        closes away from a configured structural target.
+        """
         venue = float(self._current_base_position())
         observer = getattr(self, "_fill_observer", None)
         last_fill = getattr(observer, "last_fill_ts", None)
         if last_fill is None or time.time() - last_fill > 30.0:
             return venue
-        filled = float(observer.position)
-        target = float(self.config.target_inventory)
-        if target > 0:
-            return max(venue, filled)
-        if target < 0:
-            return min(venue, filled)
-        return filled if abs(filled) > abs(venue) else venue
+        return float(observer.position)
 
     async def _current_margin_available(self) -> float:
         """Venue-computed liquidation distance for the margin-health stop.
