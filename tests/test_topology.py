@@ -1,10 +1,12 @@
 """Topology validation tests."""
 
 import pytest
+from types import SimpleNamespace
 
 from opms.connectors.topology import (
     VenueCapabilities,
     get_venue_capabilities,
+    restrict_hyperliquid_market_scope,
     validate_controller_topology,
 )
 
@@ -82,3 +84,24 @@ class TestValidateControllerTopology:
         ]
         result = validate_controller_topology(configs)
         assert len(result) == 2
+
+
+def test_native_hyperliquid_configs_disable_unneeded_hip3_polling():
+    connector = SimpleNamespace(_enable_hip3_markets=True)
+    configs = [
+        MockConfig("hyperliquid_perpetual", "ETH-USD"),
+        MockConfig("hyperliquid_perpetual", "SOL-USD"),
+    ]
+
+    restrict_hyperliquid_market_scope(configs, {"hyperliquid_perpetual": connector})
+
+    assert connector._enable_hip3_markets is False
+
+
+def test_hip3_config_keeps_hip3_polling_enabled():
+    connector = SimpleNamespace(_enable_hip3_markets=True)
+    configs = [MockConfig("hyperliquid_perpetual", "xyz:XYZ100-USD")]
+
+    restrict_hyperliquid_market_scope(configs, {"hyperliquid_perpetual": connector})
+
+    assert connector._enable_hip3_markets is True
