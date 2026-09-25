@@ -469,54 +469,72 @@ class PerpMMController(ControllerBase):
         the keeper's shared fail-closed invariant: log critically and return
         zero, which the risk policy treats as an emergency-exit breach."""
         connector = self.market_data_provider.get_connector(self.config.connector_name)
-        now = self.market_data_provider.time()
         self._ensure_resilience_state()
-        if not self._venue_circuit.allow_request(now):
-            state = self._venue_circuit.snapshot(now)
-            return fail_closed_margin_available(
-                None,
-                source=(
-                    f"{self.config.connector_name} venue circuit open for "
-                    f"{state['retry_in_s']:.1f}s after {state['last_error']}"
-                ),
-            )
-        cached = getattr(self, "_margin_cache", None)
-        if cached is not None and now - cached[1] < self.config.margin_cache_ttl:
-            return cached[0]
-        try:
-            from hummingbot.connector.derivative.hyperliquid_perpetual import (
-                hyperliquid_perpetual_constants as hl_constants,
-            )
-            spot = await self._venue_request(
-                lambda: connector._api_post(
-                    path_url=hl_constants.ACCOUNT_INFO_URL,
-                    data={
-                        "type": hl_constants.SPOT_USER_STATE_TYPE,
-                        "user": connector.hyperliquid_perpetual_address,
-                    },
-                ),
-                operation="spot clearinghouse margin read",
-            )
-            avail = {
-                int(token): value
-                for token, value in spot.get("tokenToAvailableAfterMaintenance", [])
-            }
-            value = fail_closed_margin_available(
-                avail.get(0),
-                source=f"{self.config.connector_name} spot clearinghouse state",
-            )
-        except Exception as exc:
-            # Fail closed for this cycle but never cache the failure: the next
-            # cycle retries so a transient error cannot mask a real breach.
-            return fail_closed_margin_available(
-                None,
-                source=(
-                    f"{self.config.connector_name} spot clearinghouse read failed: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-            )
-        self._margin_cache = (value, now)
-        return value
+        lock = getattr(connector, "_opms_margin_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            connector._opms_margin_lock = lock
+        async with lock:
+            now = self.market_data_provider.time()
+            cached = getattr(connector, "_opms_margin_cache", None)
+            if cached is not None and now - cached[1] < self.config.margin_cache_ttl:
+                return cached[0]
+            shared_retry_at = getattr(connector, "_opms_margin_retry_at", 0.0)
+            if now < shared_retry_at:
+                return fail_closed_margin_available(
+                    None,
+                    source=(
+                        f"{self.config.connector_name} shared margin backoff for "
+                        f"{shared_retry_at - now:.1f}s"
+                    ),
+                )
+            if not self._venue_circuit.allow_request(now):
+                state = self._venue_circuit.snapshot(now)
+                return fail_closed_margin_available(
+                    None,
+                    source=(
+                        f"{self.config.connector_name} venue circuit open for "
+                        f"{state['retry_in_s']:.1f}s after {state['last_error']}"
+                    ),
+                )
+            try:
+                from hummingbot.connector.derivative.hyperliquid_perpetual import (
+                    hyperliquid_perpetual_constants as hl_constants,
+                )
+                spot = await self._venue_request(
+                    lambda: connector._api_post(
+                        path_url=hl_constants.ACCOUNT_INFO_URL,
+                        data={
+                            "type": hl_constants.SPOT_USER_STATE_TYPE,
+                            "user": connector.hyperliquid_perpetual_address,
+                        },
+                    ),
+                    operation="spot clearinghouse margin read",
+                )
+                avail = {
+                    int(token): value
+                    for token, value in spot.get("tokenToAvailableAfterMaintenance", [])
+                }
+                value = fail_closed_margin_available(
+                    avail.get(0),
+                    source=f"{self.config.connector_name} spot clearinghouse state",
+                )
+            except Exception as exc:
+                state = self._venue_circuit.snapshot(now)
+                connector._opms_margin_retry_at = now + max(
+                    state["retry_in_s"], self.config.venue_backoff_initial,
+                )
+                # Fail closed for this cycle but never cache the failure.
+                return fail_closed_margin_available(
+                    None,
+                    source=(
+                        f"{self.config.connector_name} spot clearinghouse read failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+            connector._opms_margin_cache = (value, now)
+            connector._opms_margin_retry_at = 0.0
+            return value
 
     def _current_equity(self) -> Decimal:
         # Cross-margined account value (collateral + unrealized PnL), resolved
