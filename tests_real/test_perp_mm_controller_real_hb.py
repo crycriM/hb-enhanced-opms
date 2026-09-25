@@ -866,6 +866,32 @@ def test_margin_available_is_cached_within_ttl():
     assert len(calls) == 1  # second read served from cache within TTL
 
 
+async def test_margin_read_is_shared_by_sibling_controllers():
+    """ETH and SOL controllers on one account share one connector; they must
+    not issue the same private margin request concurrently."""
+    import asyncio
+
+    calls: list[int] = []
+
+    class _SlowCountingConnector(_ConnectorWithSpotState):
+        async def _api_post(self, path_url, data=None):
+            calls.append(1)
+            await asyncio.sleep(0.01)
+            return await super()._api_post(path_url, data)
+
+    market_data = _MarketDataWithSpot(_SlowCountingConnector(_spot_state()))
+    eth = _controller(market_data)
+    sol = _controller(market_data)
+
+    values = await asyncio.gather(
+        eth._current_margin_available(),
+        sol._current_margin_available(),
+    )
+
+    assert values == pytest.approx([271.4, 271.4])
+    assert calls == [1]
+
+
 def test_margin_cache_does_not_serve_a_failed_read():
     """A fail-closed 0.0 is never cached, but retry backoff prevents a hot loop."""
     import asyncio
