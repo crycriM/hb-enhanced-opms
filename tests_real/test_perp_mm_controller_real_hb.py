@@ -28,6 +28,7 @@ from opms.controllers.generic.perp_mm_controller import (  # noqa: E402
     PerpMMControllerConfig,
 )
 from opms.executors.passive_aggressive_executor import PassiveAggressiveExecutorConfig  # noqa: E402
+from opms.executors.buffered_maker_executor import BufferedMakerExecutorConfig  # noqa: E402
 from opms.controllers.generic.portfolio_stop import PortfolioStopBook  # noqa: E402
 
 
@@ -227,7 +228,7 @@ def test_quoting_intent_maps_to_limit_maker_order_executor():
     assert prices == [2997.6, 3002.4]
     for action in actions:
         cfg = action.executor_config
-        assert isinstance(cfg, OrderExecutorConfig)
+        assert isinstance(cfg, BufferedMakerExecutorConfig)
         assert cfg.execution_strategy == ExecutionStrategy.LIMIT_MAKER
     by_side = {a.executor_config.side: a.executor_config for a in actions}
     assert by_side[TradeType.BUY].position_action == PositionAction.OPEN
