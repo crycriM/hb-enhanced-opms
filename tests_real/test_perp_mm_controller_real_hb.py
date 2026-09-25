@@ -234,6 +234,40 @@ def test_quoting_intent_maps_to_limit_maker_order_executor():
     assert by_side[TradeType.SELL].position_action == PositionAction.CLOSE
 
 
+def test_quoting_intent_is_buffered_beyond_live_touch():
+    from hummingbot.core.data_type.common import PriceType, TradeType
+
+    class _TouchMarketData(_MarketData):
+        def get_price_by_type(self, connector_name, trading_pair, price_type):
+            if price_type == PriceType.BestBid:
+                return Decimal("2999")
+            if price_type == PriceType.BestAsk:
+                return Decimal("3001")
+            return Decimal("3000")
+
+    ctrl = _controller(_TouchMarketData())
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid",
+        coin="ETH",
+        account_id="e2_mm1",
+        target_inventory=0.0,
+        current_inventory=0.0,
+        quote=QuoteSpec(
+            bid_price=3000.0,
+            ask_price=3000.0,
+            bid_size=0.01,
+            ask_size=0.01,
+        ),
+        urgency="passive",
+    )
+
+    actions = ctrl.determine_executor_actions()
+    by_side = {a.executor_config.side: a.executor_config for a in actions}
+
+    assert by_side[TradeType.BUY].price == Decimal("2996.6008")
+    assert by_side[TradeType.SELL].price == Decimal("3003.4008")
+
+
 @pytest.mark.parametrize("dust_size", [0.00009999999999998899, 0.001])
 def test_quoting_intent_skips_orders_below_venue_minimums(dust_size):
     from hummingbot.core.data_type.common import TradeType
