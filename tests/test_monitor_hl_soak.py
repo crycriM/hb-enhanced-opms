@@ -11,7 +11,10 @@ from monitor_hl_soak import (
     _drawdown_breached,
     _oldest_order_age_s,
     _portfolio_drawdown_breached,
+    _read_error_delay_s,
+    _read_outage_breached,
 )
+from check_hl_account_state import make_read_only_info
 
 
 def test_drawdown_stop_trips_only_beyond_limit():
@@ -55,3 +58,26 @@ def test_oldest_order_age_uses_exchange_timestamp():
     orders = [{"timestamp": 100_000}, {"timestamp": 125_000}]
     assert _oldest_order_age_s(orders, now=161.0) == 61.0
     assert _oldest_order_age_s([], now=161.0) == 0.0
+
+
+def test_read_errors_back_off_but_fail_closed_after_bounded_outage():
+    assert [_read_error_delay_s(n, interval_s=10, max_delay_s=20) for n in range(1, 5)] == [10, 20, 20, 20]
+    assert not _read_outage_breached(first_error_at=100, now=144.9, max_outage_s=45)
+    assert _read_outage_breached(first_error_at=100, now=145, max_outage_s=45)
+
+
+def test_read_only_info_skips_unused_metadata_requests():
+    calls = []
+
+    class FakeInfo:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    result = make_read_only_info(FakeInfo, "https://example.invalid")
+
+    assert isinstance(result, FakeInfo)
+    assert calls == [(('https://example.invalid',), {
+        "skip_ws": True,
+        "meta": {"universe": []},
+        "spot_meta": {"tokens": [], "universe": []},
+    })]
