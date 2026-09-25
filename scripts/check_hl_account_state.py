@@ -25,6 +25,16 @@ def resolve_account(account_id: str) -> tuple[str, str | None]:
     return address.lower(), os.environ.get(f"HYPERLIQUID_{account_id.upper()}_IS_TESTNET")
 
 
+def make_read_only_info(info_cls, base_url: str):
+    """Build an Info client without fetching metadata unused by state reads."""
+    return info_cls(
+        base_url,
+        skip_ws=True,
+        meta={"universe": []},
+        spot_meta={"tokens": [], "universe": []},
+    )
+
+
 def snapshot_account(info, address: str, coins: set[str]) -> dict:
     state = info.user_state(address)
     spot = info.spot_user_state(address)
@@ -86,7 +96,7 @@ def main(argv=None) -> int:
     from hyperliquid.utils import constants
 
     address, is_testnet = resolve_account(args.account_id)
-    info = Info(constants.MAINNET_API_URL, skip_ws=True)
+    info = make_read_only_info(Info, constants.MAINNET_API_URL)
     result = {
         "account_id": args.account_id,
         "is_testnet_env": is_testnet,

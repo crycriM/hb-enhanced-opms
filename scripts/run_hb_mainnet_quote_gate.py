@@ -46,6 +46,7 @@ from run_hb_mainnet_smoke import (  # noqa: E402  (shared connector/credential p
     _resolve_account,
     _wait_ready,
 )
+from check_hl_account_state import make_read_only_info  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OTHER_ACCOUNT_IDS = ("e2_main", "e2_mm1", "e2_mm2", "e3_main", "e3_sub1")
@@ -121,7 +122,7 @@ def _hl_info():
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
 
-    return Info(constants.MAINNET_API_URL, skip_ws=True)
+    return make_read_only_info(Info, constants.MAINNET_API_URL)
 
 
 def _hl_exchange(account_id: str):

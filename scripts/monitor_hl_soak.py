@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from check_hl_account_state import REPO_ROOT, resolve_account
+from check_hl_account_state import REPO_ROOT, make_read_only_info, resolve_account
 from dotenv import load_dotenv
 
 load_dotenv(REPO_ROOT / ".env")
@@ -33,6 +33,14 @@ def _portfolio_drawdown_breached(
     equities: list[float], peak_equity: float, limit_pct: float | None,
 ) -> bool:
     return _drawdown_breached(sum(equities), peak_equity, limit_pct)
+
+
+def _read_error_delay_s(consecutive: int, interval_s: float, max_delay_s: float) -> float:
+    return min(interval_s * (2 ** max(consecutive - 1, 0)), max_delay_s)
+
+
+def _read_outage_breached(first_error_at: float, now: float, max_outage_s: float) -> bool:
+    return now - first_error_at >= max_outage_s
 
 
 def _oldest_order_age_s(orders: list[dict], now: float) -> float:
@@ -114,7 +122,9 @@ def main(argv=None) -> int:
     ap.add_argument("--account-id", dest="account_ids", action="append")
     ap.add_argument("--pid", dest="pids", action="append", type=int, required=True)
     ap.add_argument("--duration", type=float, required=True)
-    ap.add_argument("--interval", type=float, default=5.0)
+    ap.add_argument("--interval", type=float, default=10.0)
+    ap.add_argument("--max-read-outage-s", type=float, default=45.0)
+    ap.add_argument("--max-read-retry-delay-s", type=float, default=20.0)
     ap.add_argument("--leverage", type=float, default=6.0)
     ap.add_argument("--min-margin-health-ratio", type=float, default=0.15)
     ap.add_argument("--max-initial-margin-ratio", type=float, default=0.85)
@@ -129,6 +139,8 @@ def main(argv=None) -> int:
         ap.error("--max-drawdown-pct must be in (0, 100]")
     if min(args.max_order_age_s, args.max_decision_age_s, args.decision_startup_grace_s) <= 0:
         ap.error("order age, decision age, and startup grace must be positive")
+    if min(args.interval, args.max_read_outage_s, args.max_read_retry_delay_s) <= 0:
+        ap.error("read interval, outage limit, and retry delay must be positive")
     account_ids = args.account_ids or ["e2_mm1"]
     if len(account_ids) != len(args.pids):
         ap.error("repeat --account-id and --pid once per monitored account")
@@ -155,11 +167,12 @@ def main(argv=None) -> int:
         accounts.append((account_id, address))
     if len({str(address).lower() for _, address in accounts}) != len(accounts):
         raise SystemExit("monitor refuses duplicate account addresses")
-    info = Info(constants.MAINNET_API_URL, skip_ws=True)
+    info = make_read_only_info(Info, constants.MAINNET_API_URL)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + args.duration + 90.0
     consecutive_errors = 0
+    first_read_error_at = None
     peak_equity = 0.0
     started_at = time.time()
 
@@ -197,6 +210,7 @@ def main(argv=None) -> int:
                 stream.flush()
                 print(json.dumps(sample), flush=True)
                 consecutive_errors = 0
+                first_read_error_at = None
                 breach = None
                 for account in account_samples:
                     account_id = account["account_id"]
@@ -231,15 +245,27 @@ def main(argv=None) -> int:
                     return 1
             except Exception as exc:  # fail closed after repeated read failures
                 consecutive_errors += 1
-                event = {"ts": time.time(), "event": "read_error",
+                error_at = time.time()
+                if first_read_error_at is None:
+                    first_read_error_at = error_at
+                retry_delay = _read_error_delay_s(
+                    consecutive_errors, args.interval, args.max_read_retry_delay_s,
+                )
+                event = {"ts": error_at, "event": "read_error",
                          "error": f"{type(exc).__name__}: {exc}",
-                         "consecutive": consecutive_errors}
+                         "consecutive": consecutive_errors,
+                         "outage_s": error_at - first_read_error_at,
+                         "retry_in_s": retry_delay}
                 stream.write(json.dumps(event) + "\n")
                 stream.flush()
                 print(json.dumps(event), flush=True)
-                if consecutive_errors >= 3:
+                if _read_outage_breached(
+                    first_read_error_at, error_at, args.max_read_outage_s,
+                ):
                     _signal_all(args.pids)
                     return 1
+                time.sleep(retry_delay)
+                continue
             time.sleep(args.interval)
     if time.time() >= deadline and any(_alive(pid) for pid in args.pids):
         _signal_all(args.pids)

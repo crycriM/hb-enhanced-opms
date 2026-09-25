@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from check_hl_account_state import REPO_ROOT, resolve_account, snapshot_account
+from check_hl_account_state import REPO_ROOT, make_read_only_info, resolve_account, snapshot_account
 from dotenv import load_dotenv
 
 load_dotenv(REPO_ROOT / ".env")
@@ -57,11 +57,17 @@ def main(argv=None) -> int:
     address, is_testnet = resolve_account(args.account_id)
     if str(is_testnet).lower() != "false":
         raise SystemExit("cleanup refuses a non-mainnet credential environment")
-    info = Info(constants.MAINNET_API_URL, skip_ws=True)
-    exchange = _exchange(args.account_id, address)
+    info = make_read_only_info(Info, constants.MAINNET_API_URL)
+    exchange = None
     coins = set(args.coins)
     report = {"account_id": args.account_id, "address": f"{address[:8]}..{address[-4:]}",
               "coins": sorted(coins), "actions": [], "failures": []}
+
+    def signed_exchange():
+        nonlocal exchange
+        if exchange is None:
+            exchange = _exchange(args.account_id, address)
+        return exchange
 
     def cancel_open_orders() -> None:
         for order in info.open_orders(address):
@@ -70,7 +76,7 @@ def main(argv=None) -> int:
             oid = int(order["oid"])
             coin = order["coin"]
             try:
-                response = exchange.cancel(coin, oid)
+                response = signed_exchange().cancel(coin, oid)
                 report["actions"].append({"action": "cancel", "coin": coin,
                                           "oid": oid, "response": str(response)})
             except Exception as exc:  # continue to attempt other scoped cleanup
@@ -84,7 +90,7 @@ def main(argv=None) -> int:
             if coin not in coins or abs(float(position.get("szi", 0.0))) <= 1e-12:
                 continue
             try:
-                response = exchange.market_close(coin)
+                response = signed_exchange().market_close(coin)
                 report["actions"].append({"action": "market_close", "coin": coin,
                                           "szi": position.get("szi"),
                                           "response": str(response)})
