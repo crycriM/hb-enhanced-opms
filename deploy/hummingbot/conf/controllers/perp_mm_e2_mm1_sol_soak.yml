@@ -12,7 +12,7 @@ kappa: 0.7
 widen_factor: 2.0
 max_position: 1.0
 critical_position: 1.25
-target_inventory: -2.0
+target_inventory: -1.0
 leverage: 6
 regime_stop: false
 toxic_markout_bps: null
