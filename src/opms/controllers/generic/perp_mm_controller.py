@@ -135,6 +135,10 @@ class PerpMMControllerConfig(ControllerConfigBase):
     # Keep a confirmed live maker pair for this long before a two-phase
     # cancel-then-create refresh. Never overlap old and new target-sized quotes.
     quote_refresh_interval: float = 20.0
+    # Leave a small cushion beyond the observed touch. LIMIT_MAKER clamps at
+    # the touch, but a fast move between the local snapshot and HL's matching
+    # engine otherwise causes repeated ALO rejections at one stale price.
+    quote_post_only_buffer_bps: float = Field(default=8.0, ge=0.0)
     # Explicit deadlines and rate-limit-aware backoff for controller-owned HL
     # requests (margin state and post-fill position reconciliation).
     venue_request_timeout: float = 5.0
@@ -772,8 +776,14 @@ class PerpMMController(ControllerBase):
         return str(getattr(side, "value", side)).lower()
 
     def _quote_create_actions(self, specs, timestamp: float) -> list[ExecutorAction]:
-        return [
-            CreateExecutorAction(
+        actions = []
+        for spec in specs:
+            if spec.side is None or spec.amount <= 0:
+                continue
+            price = self._buffered_maker_price(spec)
+            if price is None:
+                continue
+            actions.append(CreateExecutorAction(
                 controller_id=self.config.id,
                 executor_config=OrderExecutorConfig(
                     timestamp=timestamp,
@@ -781,19 +791,36 @@ class PerpMMController(ControllerBase):
                     connector_name=self.config.connector_name,
                     side=TradeType.BUY if spec.side == "buy" else TradeType.SELL,
                     amount=Decimal(str(spec.amount)),
-                    price=Decimal(str(spec.price)) if spec.price is not None else None,
-                    execution_strategy=(
-                        ExecutionStrategy.LIMIT_MAKER
-                        if spec.price is not None else ExecutionStrategy.MARKET
-                    ),
+                    price=price,
+                    execution_strategy=ExecutionStrategy.LIMIT_MAKER,
                     position_action=(
                         PositionAction.CLOSE if spec.reduce_only else PositionAction.OPEN
                     ),
                     leverage=self.config.leverage,
                 ),
+            ))
+        return actions
+
+    def _buffered_maker_price(self, spec) -> Decimal | None:
+        price_type = PriceType.BestBid if spec.side == "buy" else PriceType.BestAsk
+        touch = Decimal(str(self.get_current_price(
+            self.config.connector_name, self.config.trading_pair, price_type
+        )))
+        if not touch.is_finite() or touch <= 0:
+            logger.error(
+                "%s has no valid %s; skipping maker quote",
+                self.config.trading_pair, price_type,
             )
-            for spec in specs if spec.side is not None and spec.amount > 0
-        ]
+            return None
+        edge = Decimal(str(self.config.quote_post_only_buffer_bps)) / Decimal("10000")
+        intent_price = Decimal(str(spec.price))
+        buffered_touch = touch * (
+            Decimal("1") - edge if spec.side == "buy" else Decimal("1") + edge
+        )
+        return (
+            min(intent_price, buffered_touch)
+            if spec.side == "buy" else max(intent_price, buffered_touch)
+        )
 
     def _executable_quote_specs(self, specs):
         rules = self.market_data_provider.get_trading_rules(

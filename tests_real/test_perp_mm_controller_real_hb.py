@@ -224,7 +224,7 @@ def test_quoting_intent_maps_to_limit_maker_order_executor():
     actions = ctrl.determine_executor_actions()
     assert len(actions) == 2
     prices = sorted(float(a.executor_config.price) for a in actions)
-    assert prices == [2999.0, 3001.0]
+    assert prices == [2997.6, 3002.4]
     for action in actions:
         cfg = action.executor_config
         assert isinstance(cfg, OrderExecutorConfig)
