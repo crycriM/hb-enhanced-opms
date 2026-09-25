@@ -783,6 +783,23 @@ def test_recent_fill_position_caps_quotes_while_connector_cache_lags():
     assert ctrl._position_for_decision() == pytest.approx(-0.5)
 
 
+def test_recent_close_fill_overrides_stale_position_with_structural_target():
+    """A completed basket-stop close must not be undone by a stale cache.
+
+    The configured target remains nonzero, but the shared fill ledger already
+    knows the close reached flat. Reusing the cached pre-close position would
+    create another reduce-only order for exposure that no longer exists.
+    """
+    import time
+    from types import SimpleNamespace
+
+    ctrl = _controller(_MarketData(positions=[_position("-1")]))
+    ctrl.config = _config(target_inventory=-4.0)
+    ctrl._fill_observer = SimpleNamespace(position=0.0, last_fill_ts=time.time())
+
+    assert ctrl._position_for_decision() == pytest.approx(0.0)
+
+
 def test_growing_de_risk_need_tops_up_instead_of_being_dropped():
     """Review #4: dedup keyed only on (type, side, time_limit) silently drops a
     larger follow-up de-risk on an already-running executor."""

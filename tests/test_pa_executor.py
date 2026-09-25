@@ -272,6 +272,22 @@ class TestOrderFailure:
         exe._step()
         assert strategy.buy.call_count == 2
 
+    def test_redundant_reduce_only_failure_is_terminal(self):
+        strategy = _make_strategy()
+        config = _make_config(total=Decimal("1"), child_q=Decimal("1"))
+        config.position_action = PositionAction.CLOSE
+        exe = PassiveAggressiveExecutor(strategy, config)
+        exe._step()
+        order_id = exe._children[0].tracked_order.order_id
+        event = _failed_event(order_id)
+        event.error_message = "Reduce only order would increase position. asset=5"
+
+        exe.process_order_failed_event(0, None, event)
+
+        assert exe._status == RunnableStatus.TERMINATED
+        assert exe.close_type == CloseType.EARLY_STOP
+        assert strategy.buy.call_count == 1
+
 
 class TestOutcomeTrueCloseType:
     """A run that did not execute the full size must never close COMPLETED."""
