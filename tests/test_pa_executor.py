@@ -259,6 +259,19 @@ class TestOrderFailure:
         assert exe._children[0].status == _ChildStatus.IDLE
         assert exe._current_retries == 1
 
+    def test_failed_passive_order_waits_before_repricing(self):
+        exe, strategy = _make_executor()
+        exe._step()
+        order_id = exe._children[0].tracked_order.order_id
+
+        exe.process_order_failed_event(0, None, _failed_event(order_id))
+        exe._step()
+
+        assert strategy.buy.call_count == 1
+        exe._strategy.current_timestamp += 2.0
+        exe._step()
+        assert strategy.buy.call_count == 2
+
 
 class TestOutcomeTrueCloseType:
     """A run that did not execute the full size must never close COMPLETED."""
