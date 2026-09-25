@@ -10,9 +10,9 @@ account_id: e2_mm1
 gamma: 4.0
 kappa: 0.5
 widen_factor: 2.0
-max_position: 1.0
-critical_position: 2.0
-target_inventory: 0.4
+max_position: 0.05
+critical_position: 0.075
+target_inventory: 0.2
 leverage: 6
 regime_stop: false
 toxic_markout_bps: null

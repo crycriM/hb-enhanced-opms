@@ -55,8 +55,8 @@ def main() -> int:
         f"perp_mm_{account}_sol_soak",
     }:
         raise ValueError("unexpected soak controller ids")
-    expected = ({"ETH-USD": 0.4, "SOL-USD": -4.0} if account == "e2_mm1"
-                else {"ETH-USD": -0.4, "SOL-USD": 4.0})
+    expected = ({"ETH-USD": 0.2, "SOL-USD": -2.0} if account == "e2_mm1"
+                else {"ETH-USD": -0.2, "SOL-USD": 2.0})
     targets = {c.trading_pair: c.target_inventory for c in controllers}
     if targets != expected:
         raise ValueError(f"unexpected soak targets: {targets!r}")
