@@ -15,8 +15,8 @@ def _config(account: str, coin: str) -> dict:
 def test_dual_soak_profile_fits_account_margin_budget_at_critical_caps():
     conservative_prices = {"ETH": 3_000.0, "SOL": 150.0}
     expected = {
-        "e2_mm1": {"ETH": (0.2, 0.05, 0.075), "SOL": (-2.0, 1.0, 1.25)},
-        "e3_sub1": {"ETH": (-0.2, 0.05, 0.075), "SOL": (2.0, 1.0, 1.25)},
+        "e2_mm1": {"ETH": (0.1, 0.1, 0.125), "SOL": (-1.0, 1.0, 1.25)},
+        "e3_sub1": {"ETH": (-0.1, 0.1, 0.125), "SOL": (1.0, 1.0, 1.25)},
     }
 
     for account, coins in expected.items():
@@ -26,6 +26,7 @@ def test_dual_soak_profile_fits_account_margin_budget_at_critical_caps():
             assert (cfg["target_inventory"], cfg["max_position"], cfg["critical_position"]) == (
                 target, soft_cap, hard_cap,
             )
+            assert hard_cap > abs(target)
             critical_notional += (abs(target) + hard_cap) * conservative_prices[coin]
 
         initial_margin_ratio = critical_notional / 6 / 300
