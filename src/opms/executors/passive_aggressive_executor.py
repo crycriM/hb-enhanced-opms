@@ -89,6 +89,7 @@ class _ChildSlot:
     filled: Decimal = Decimal("0")
     cycle_start: Optional[float] = None
     refresh_start: Optional[float] = None
+    retry_at: Optional[float] = None
     # Reason for last cancel, drives post-cancel action
     cancel_reason: str = ""  # "refresh" | "cycle_expired"
 
@@ -224,7 +225,10 @@ class PassiveAggressiveExecutor(ExecutorBase):
                     f"(filled {child.filled}/{child.target})"
                 )
                 child.status = _ChildStatus.SKIPPED
+            elif child.retry_at is not None and now < child.retry_at:
+                return
             else:
+                child.retry_at = None
                 self._place_limit(child)
 
         elif child.status == _ChildStatus.ACTIVE:
@@ -420,9 +424,14 @@ class PassiveAggressiveExecutor(ExecutorBase):
         child.status = _ChildStatus.IDLE
         child.tracked_order = None
         self._current_retries += 1
+        retry_delay = min(
+            2 ** min(self._current_retries, 4),
+            self.config.child_order_refresh_time,
+        )
+        child.retry_at = self._strategy.current_timestamp + retry_delay
         logger.warning(
             f"PA child {self._child_idx}: order failed [{event.order_id}], "
-            f"retry {self._current_retries}/{self._max_retries}"
+            f"retry {self._current_retries}/{self._max_retries} in {retry_delay:.1f}s"
         )
         if (was_aggressive and self._status == RunnableStatus.RUNNING
                 and self._current_retries <= self._max_retries):
