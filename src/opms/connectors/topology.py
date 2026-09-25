@@ -39,4 +39,19 @@ def validate_controller_topology(configs: list) -> list:
     return configs
 
 
-__all__ = ["VenueCapabilities", "get_venue_capabilities", "validate_controller_topology"]
+def restrict_hyperliquid_market_scope(configs: list, connectors: dict) -> None:
+    """Skip HIP-3 discovery/polling when a connector only serves native perps."""
+    pairs_by_connector: defaultdict[str, list[str]] = defaultdict(list)
+    for cfg in configs:
+        pairs_by_connector[cfg.connector_name].append(cfg.trading_pair)
+    for name, pairs in pairs_by_connector.items():
+        if name.startswith("hyperliquid_perpetual") and all(":" not in pair for pair in pairs):
+            connectors[name]._enable_hip3_markets = False
+
+
+__all__ = [
+    "VenueCapabilities",
+    "get_venue_capabilities",
+    "restrict_hyperliquid_market_scope",
+    "validate_controller_topology",
+]

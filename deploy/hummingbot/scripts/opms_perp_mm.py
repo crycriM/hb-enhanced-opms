@@ -26,7 +26,7 @@ from dotenv import dotenv_values
 
 import opms
 import scripts.v2_with_controllers as v2  # module alias: HB picks the strategy/config classes via inspect.getmembers
-from opms.connectors.topology import validate_controller_topology
+from opms.connectors.topology import restrict_hyperliquid_market_scope, validate_controller_topology
 from opms.controllers.generic.portfolio_stop import PortfolioStopBook
 
 # The monorepo .env (AGENTS.md credential convention). Read, never exported:
@@ -42,6 +42,7 @@ class OpmsPerpMM(v2.V2WithControllers):
     def __init__(self, connectors, config: OpmsPerpMMConfig):
         controller_configs = config.load_controller_configs()
         validate_controller_topology(controller_configs)
+        restrict_hyperliquid_market_scope(controller_configs, connectors)
         env = {**dotenv_values(_ENV_FILE), **os.environ}
         for cfg in controller_configs:
             _check_account_routing(cfg, connectors[cfg.connector_name], env)
