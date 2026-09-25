@@ -321,32 +321,19 @@ class PerpMMController(ControllerBase):
             logger.exception("Could not publish portfolio emergency; local flatten remains active")
 
     async def _refresh_positions_after_fills(self) -> None:
-        """Re-read venue positions once an executor that traded has finished.
+        """Account for completed traders without adding another venue request.
 
-        The connector's position cache polls every 5–12 s (HL). In the cycle
-        right after a de-risk completes it still shows the pre-fill size, so
-        the keeper re-issues a de-risk for inventory that is already gone —
-        seen live on mainnet as a second reduce-only PA rejected 9× with
-        "Reduce only order would increase position".
+        The shared fill ledger is authoritative for 30 seconds after a fill,
+        which covers HL's normal 5–12 second connector poll. Calling the
+        private position endpoint here duplicated that poll, repeatedly timed
+        out under load, and opened the same circuit used by margin safety.
         """
         current = self.executors_info
         # Drop ids that have aged out of the live executor list so the set stays
         # bounded to the process's active window (review #5).
         self._settled_executor_ids &= {e.id for e in current}
         traded = {e.id for e in current if e.is_done and e.filled_amount_quote > 0}
-        pending = traded - self._settled_executor_ids
-        if pending:
-            connector = self.market_data_provider.get_connector(self.config.connector_name)
-            try:
-                await self._venue_request(
-                    connector._update_positions,
-                    operation="post-fill position refresh",
-                )
-            except Exception:
-                # Do not mark the ids settled: a half-open probe retries after
-                # backoff. Margin then fails closed through the same circuit.
-                return
-            self._settled_executor_ids |= pending
+        self._settled_executor_ids |= traded
 
     async def _venue_request(self, request_factory, *, operation: str):
         """Run one controller-owned venue request under deadline/backoff."""
