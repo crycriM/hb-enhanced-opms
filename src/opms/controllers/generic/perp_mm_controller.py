@@ -33,6 +33,10 @@ from perp_bot.margin_health import fail_closed_margin_available
 from perp_bot.opms_client import Position
 
 from opms.analytics.fill_observer import FillObserver
+from opms.executors.buffered_maker_executor import (
+    BufferedMakerExecutor,
+    BufferedMakerExecutorConfig,
+)
 from opms.executors.passive_aggressive_executor import PassiveAggressiveExecutor, PassiveAggressiveExecutorConfig
 from opms.resilience import QuoteLivenessWatchdog, VenueCircuitBreaker
 
@@ -54,13 +58,21 @@ logger = logging.getLogger(__name__)
 ExecutorOrchestrator._executor_mapping.setdefault(
     "passive_aggressive_executor", PassiveAggressiveExecutor
 )
+ExecutorOrchestrator._executor_mapping.setdefault(
+    "buffered_maker_executor", BufferedMakerExecutor
+)
 # Creating it is only half: ExecutorInfo.config is a pydantic discriminated
 # union over HB's built-in configs, so `executor.executor_info` raises for a
 # running PA — which breaks controller executor reports, get_active_executors,
 # and MarketsRecorder.store_or_update_executor. Found live on mainnet.
 _info_config = ExecutorInfo.model_fields["config"]
-if PassiveAggressiveExecutorConfig not in getattr(_info_config.annotation, "__args__", ()):
-    _info_config.annotation = Union[_info_config.annotation, PassiveAggressiveExecutorConfig]
+for config_type in (PassiveAggressiveExecutorConfig, BufferedMakerExecutorConfig):
+    if config_type not in getattr(_info_config.annotation, "__args__", ()):
+        _info_config.annotation = Union[_info_config.annotation, config_type]
+if any(
+    config_type in getattr(_info_config.annotation, "__args__", ())
+    for config_type in (PassiveAggressiveExecutorConfig, BufferedMakerExecutorConfig)
+):
     ExecutorInfo.model_rebuild(force=True)
 
 
@@ -739,7 +751,7 @@ class PerpMMController(ControllerBase):
         config = executor.config
         strategy = getattr(config, "execution_strategy", None)
         value = getattr(strategy, "value", strategy)
-        return config.type == "order_executor" and value == "LIMIT_MAKER"
+        return config.type in {"order_executor", "buffered_maker_executor"} and value == "LIMIT_MAKER"
 
     def _live_quote_sides(self, active) -> set[str]:
         live: set[str] = set()
@@ -771,7 +783,7 @@ class PerpMMController(ControllerBase):
                 continue
             actions.append(CreateExecutorAction(
                 controller_id=self.config.id,
-                executor_config=OrderExecutorConfig(
+                executor_config=BufferedMakerExecutorConfig(
                     timestamp=timestamp,
                     trading_pair=self.config.trading_pair,
                     connector_name=self.config.connector_name,
@@ -783,6 +795,7 @@ class PerpMMController(ControllerBase):
                         PositionAction.CLOSE if spec.reduce_only else PositionAction.OPEN
                     ),
                     leverage=self.config.leverage,
+                    maker_buffer_bps=Decimal(str(self.config.quote_post_only_buffer_bps)),
                 ),
             ))
         return actions
