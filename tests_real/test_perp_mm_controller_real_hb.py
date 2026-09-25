@@ -551,9 +551,10 @@ def test_quote_stop_waits_for_cancel_confirmation_before_flattening():
     assert isinstance(close_phase[0].executor_config, PassiveAggressiveExecutorConfig)
 
 
-def test_positions_refresh_once_after_a_traded_executor_finishes():
-    """Stale position cache right after a de-risk fill re-issued a reduce-only
-    de-risk live; the controller must re-read positions at that moment."""
+def test_traded_executor_does_not_force_an_extra_position_rest_call():
+    """The shared fill ledger is authoritative until HB's normal poll catches
+    up; an extra position request here competes with margin safety and timed
+    out repeatedly during the live soak."""
     import asyncio
     from types import SimpleNamespace
 
@@ -580,7 +581,8 @@ def test_positions_refresh_once_after_a_traded_executor_finishes():
     ctrl.executors_info = [done_unfilled_quote, running, done_traded]
     asyncio.run(ctrl._refresh_positions_after_fills())
     asyncio.run(ctrl._refresh_positions_after_fills())
-    assert calls == [1]                     # once per finished, traded executor
+    assert calls == []                       # connector background poll owns REST
+    assert ctrl._settled_executor_ids == {"pa-1"}
 
 
 def _hb_constructed(**overrides):
