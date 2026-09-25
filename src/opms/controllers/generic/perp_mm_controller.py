@@ -205,6 +205,7 @@ class PerpMMController(ControllerBase):
             recovery_cooldown_s=config.quote_recovery_cooldown,
         )
         self._quote_refresh_pending = False
+        self._market_data_unready = False
         db_path = os.environ.get("OPMS_PORTFOLIO_STOP_DB")
         members_raw = os.environ.get("OPMS_PORTFOLIO_MEMBERS")
         if bool(db_path) != bool(members_raw):
@@ -232,6 +233,8 @@ class PerpMMController(ControllerBase):
             )
         if not hasattr(self, "_quote_refresh_pending"):
             self._quote_refresh_pending = False
+        if not hasattr(self, "_market_data_unready"):
+            self._market_data_unready = False
 
     async def on_start(self):
         connector = self.market_data_provider.get_connector(self.config.connector_name)
@@ -249,24 +252,36 @@ class PerpMMController(ControllerBase):
         hung venue read. We instead turn a deadline/transport failure into an
         emergency flatten intent, then enqueue its cancel/close actions.
         """
-        if not (self.market_data_provider.ready and self.executors_update_event.is_set()):
+        if not self.executors_update_event.is_set():
             return
-        try:
-            await asyncio.wait_for(
-                self.update_processed_data(),
-                timeout=getattr(self.config, "control_cycle_timeout", 15.0),
-            )
-        except Exception as exc:
-            self._ensure_resilience_state()
-            now = self.market_data_provider.time()
-            if self._venue_circuit.allow_request(now):
-                self._venue_circuit.record_failure(now, exc)
-            logger.error(
-                "%s control cycle failed; forcing quote cancel/flatten: %s: %s",
-                self.config.trading_pair, type(exc).__name__, exc,
-                exc_info=True,
-            )
+        self._ensure_resilience_state()
+        if not self.market_data_provider.ready:
+            if not self._market_data_unready:
+                logger.error(
+                    "%s market data provider is not ready; forcing quote cancel/flatten",
+                    self.config.trading_pair,
+                )
+            self._market_data_unready = True
             self._force_flatten_intent()
+        else:
+            if self._market_data_unready:
+                logger.info("%s market data provider recovered", self.config.trading_pair)
+            self._market_data_unready = False
+            try:
+                await asyncio.wait_for(
+                    self.update_processed_data(),
+                    timeout=getattr(self.config, "control_cycle_timeout", 15.0),
+                )
+            except Exception as exc:
+                now = self.market_data_provider.time()
+                if self._venue_circuit.allow_request(now):
+                    self._venue_circuit.record_failure(now, exc)
+                logger.error(
+                    "%s control cycle failed; forcing quote cancel/flatten: %s: %s",
+                    self.config.trading_pair, type(exc).__name__, exc,
+                    exc_info=True,
+                )
+                self._force_flatten_intent()
 
         actions = self.determine_executor_actions()
         if actions:
