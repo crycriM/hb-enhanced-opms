@@ -674,6 +674,34 @@ async def test_update_processed_data_feeds_margin_available_to_keeper():
     assert ctrl.keeper._margin_available == pytest.approx(271.4)
 
 
+async def test_control_task_cancels_quotes_when_connector_is_not_ready():
+    import asyncio
+    from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+
+    ctrl = _controller()
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", account_id="e2_mm1",
+        target_inventory=0.4, current_inventory=0.0,
+        quote=QuoteSpec(
+            bid_price=2999.0, ask_price=3001.0,
+            bid_size=0.01, ask_size=0.01,
+        ),
+        urgency="passive",
+    )
+    quote = ctrl.determine_executor_actions()[0].executor_config
+    _with_active(ctrl, [_ExecInfo("stale-quote", quote, {"order_id": "oid-1"})])
+    ctrl.market_data_provider.ready = False
+    ctrl.executors_update_event = asyncio.Event()
+    ctrl.executors_update_event.set()
+    ctrl.actions_queue = asyncio.Queue()
+
+    await ctrl.control_task()
+
+    actions = ctrl.actions_queue.get_nowait()
+    assert ctrl._client.last_intent.urgency == "emergency"
+    assert [type(action) for action in actions] == [StopExecutorAction]
+
+
 # --- code-review 2026-09-16 fixes ---------------------------------------------
 
 
