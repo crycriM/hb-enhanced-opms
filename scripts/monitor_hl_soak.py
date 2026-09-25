@@ -35,6 +35,33 @@ def _portfolio_drawdown_breached(
     return _drawdown_breached(sum(equities), peak_equity, limit_pct)
 
 
+def _oldest_order_age_s(orders: list[dict], now: float) -> float:
+    if not orders:
+        return 0.0
+    return max(max(now - float(order.get("timestamp", 0)) / 1000, 0.0) for order in orders)
+
+
+def _decision_liveness_breach(
+    logs: dict[str, Path], *, now: float, started_at: float,
+    max_age_s: float, startup_grace_s: float,
+) -> str | None:
+    for label, path in logs.items():
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            if now - started_at > startup_grace_s:
+                return f"{label} decision log missing after {startup_grace_s:.0f}s startup grace"
+            continue
+        if stat.st_size == 0:
+            if now - started_at > startup_grace_s:
+                return f"{label} decision log empty after {startup_grace_s:.0f}s startup grace"
+            continue
+        age = max(now - stat.st_mtime, 0.0)
+        if age > max_age_s:
+            return f"{label} decision log stale for {age:.1f}s > {max_age_s:.1f}s"
+    return None
+
+
 def _signal_all(pids: list[int]) -> None:
     for pid in pids:
         try:
@@ -43,7 +70,9 @@ def _signal_all(pids: list[int]) -> None:
             pass
 
 
-def _account_sample(info, account_id: str, address: str, mids: dict, leverage: float) -> dict:
+def _account_sample(
+    info, account_id: str, address: str, mids: dict, leverage: float, now: float,
+) -> dict:
     state = info.user_state(address)
     spot = info.spot_user_state(address)
     spot_usdc = next((b for b in spot.get("balances", []) if b.get("coin") == "USDC"), {})
@@ -64,6 +93,7 @@ def _account_sample(info, account_id: str, address: str, mids: dict, leverage: f
         mid = float(mids.get(coin, 0.0) or 0.0)
         gross_notional += abs(szi) * mid
         positions.append({"coin": coin, "szi": szi, "mid": mid})
+    open_orders = [o for o in info.open_orders(address) if o.get("coin") in {"ETH", "SOL"}]
     initial_margin = gross_notional / leverage
     return {
         "account_id": account_id,
@@ -73,8 +103,8 @@ def _account_sample(info, account_id: str, address: str, mids: dict, leverage: f
         "gross_notional": gross_notional,
         "initial_margin": initial_margin,
         "initial_margin_ratio": initial_margin / equity if equity > 0 else 1.0,
-        "open_orders": len([o for o in info.open_orders(address)
-                            if o.get("coin") in {"ETH", "SOL"}]),
+        "open_orders": len(open_orders),
+        "oldest_order_age_s": _oldest_order_age_s(open_orders, now),
         "positions": positions,
     }
 
@@ -89,15 +119,30 @@ def main(argv=None) -> int:
     ap.add_argument("--min-margin-health-ratio", type=float, default=0.15)
     ap.add_argument("--max-initial-margin-ratio", type=float, default=0.85)
     ap.add_argument("--max-drawdown-pct", type=float)
+    ap.add_argument("--max-order-age-s", type=float, default=90.0)
+    ap.add_argument("--max-decision-age-s", type=float, default=30.0)
+    ap.add_argument("--decision-startup-grace-s", type=float, default=90.0)
+    ap.add_argument("--decision-log", action="append", default=[])
     ap.add_argument("--output", required=True)
     args = ap.parse_args(argv)
     if args.max_drawdown_pct is not None and not 0 < args.max_drawdown_pct <= 100:
         ap.error("--max-drawdown-pct must be in (0, 100]")
+    if min(args.max_order_age_s, args.max_decision_age_s, args.decision_startup_grace_s) <= 0:
+        ap.error("order age, decision age, and startup grace must be positive")
     account_ids = args.account_ids or ["e2_mm1"]
     if len(account_ids) != len(args.pids):
         ap.error("repeat --account-id and --pid once per monitored account")
     if len(set(account_ids)) != len(account_ids):
         ap.error("--account-id values must be distinct")
+    decision_logs = {}
+    for value in args.decision_log:
+        if "=" not in value:
+            ap.error("--decision-log must be LABEL=/absolute/path")
+        label, raw_path = value.split("=", 1)
+        path = Path(raw_path)
+        if not label or not path.is_absolute() or label in decision_logs:
+            ap.error("decision-log labels must be unique and paths absolute")
+        decision_logs[label] = path
 
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
@@ -116,13 +161,27 @@ def main(argv=None) -> int:
     deadline = time.time() + args.duration + 90.0
     consecutive_errors = 0
     peak_equity = 0.0
+    started_at = time.time()
 
     with output.open("w") as stream:
         while all(_alive(pid) for pid in args.pids) and time.time() < deadline:
+            now = time.time()
+            liveness_breach = _decision_liveness_breach(
+                decision_logs, now=now, started_at=started_at,
+                max_age_s=args.max_decision_age_s,
+                startup_grace_s=args.decision_startup_grace_s,
+            )
+            if liveness_breach:
+                event = {"ts": now, "event": "risk_breach", "reason": liveness_breach}
+                stream.write(json.dumps(event) + "\n")
+                stream.flush()
+                print(json.dumps(event), flush=True)
+                _signal_all(args.pids)
+                return 1
             try:
                 mids = info.all_mids()
                 account_samples = [
-                    _account_sample(info, account_id, address, mids, args.leverage)
+                    _account_sample(info, account_id, address, mids, args.leverage, now)
                     for account_id, address in accounts
                 ]
                 equities = [sample["equity"] for sample in account_samples]
@@ -151,6 +210,10 @@ def main(argv=None) -> int:
                         breach = (f"{account_id} initial margin ratio "
                                   f"{account['initial_margin_ratio']:.3f} > "
                                   f"{args.max_initial_margin_ratio:.3f}")
+                    elif account["oldest_order_age_s"] > args.max_order_age_s:
+                        breach = (f"{account_id} oldest order age "
+                                  f"{account['oldest_order_age_s']:.1f}s > "
+                                  f"{args.max_order_age_s:.1f}s")
                     if breach:
                         break
                 if not breach and _portfolio_drawdown_breached(

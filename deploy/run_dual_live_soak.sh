@@ -9,6 +9,8 @@ PY="${PY:-/home/christian/miniforge3/envs/hummingbot/bin/python}"
 ENV_FILE="$REPO/.env"
 MIN_COLLATERAL="${MIN_COLLATERAL:-300}"
 MAX_DRAWDOWN_PCT="${MAX_DRAWDOWN_PCT:-1.0}"
+MAX_ORDER_AGE_S="${MAX_ORDER_AGE_S:-90}"
+MAX_DECISION_AGE_S="${MAX_DECISION_AGE_S:-30}"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$REPO/hb-enhanced-opms/logs/live_dual_soak_${STAMP}}"
 COMMON_PYTHONPATH="$REPO/hb-enhanced-opms/src:$REPO/perp-bot/src:$REPO/mm-core/src"
@@ -206,6 +208,11 @@ done
   --account-id e2_mm1 --pid "${HB_PID[e2_mm1]}" \
   --account-id e3_sub1 --pid "${HB_PID[e3_sub1]}" \
   --duration "$DURATION" --max-drawdown-pct "$MAX_DRAWDOWN_PCT" \
+  --max-order-age-s "$MAX_ORDER_AGE_S" --max-decision-age-s "$MAX_DECISION_AGE_S" \
+  --decision-log "e2_mm1:ETH=$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_eth_soak.decisions.jsonl" \
+  --decision-log "e2_mm1:SOL=$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_sol_soak.decisions.jsonl" \
+  --decision-log "e3_sub1:ETH=$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e3_sub1_eth_soak.decisions.jsonl" \
+  --decision-log "e3_sub1:SOL=$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e3_sub1_sol_soak.decisions.jsonl" \
   --output "$ARTIFACT_DIR/combined_monitor.jsonl" \
   >"$ARTIFACT_DIR/combined_monitor.log" 2>&1 &
 MON_PID=$!
