@@ -358,9 +358,11 @@ portfolio-stop database. It refuses to launch unless both accounts have
 distinct agent signers, clean ETH/SOL state, at least 300 USDC each, and
 explicit mainnet/order confirmation. Each account has an independent margin
 health and initial-margin check; drawdown is measured once against the peak of
-their combined equity. At the deadline or on an early failure, the runner
-stops both instances, cancels scoped orders, closes scoped positions, and
-checks both accounts are flat. Logs and preflight/cleanup snapshots go to
+their combined equity. The monitor also requires every controller decision
+log to advance within 30 seconds and every scoped order to refresh within 90
+seconds. At the deadline or on an early failure, the runner stops both
+instances, cancels scoped orders, closes scoped positions, and checks both
+accounts are flat. Logs and preflight/cleanup snapshots go to
 `logs/live_dual_soak_<timestamp>/`. The collateral threshold defaults to
 300 USDC per account (`MIN_COLLATERAL`).
 
