@@ -109,6 +109,8 @@ class PerpMMControllerConfig(ControllerConfigBase):
     widen_factor: float = 2.0
     max_position: float = 10.0
     critical_position: float = 20.0
+    quote_size: float | None = Field(default=None, gt=0.0)
+    price_tick: float | None = Field(default=None, gt=0.0)
     # Persistent inventory tilt for a cross-hedged basket leg.  Risk limits
     # are evaluated relative to this target by perp_bot/mm_core.
     target_inventory: float = 0.0
@@ -187,6 +189,8 @@ class PerpMMController(ControllerBase):
             account_id=config.account_id,
             target_inventory=config.target_inventory,
             leverage=config.leverage,
+            quote_size=config.quote_size,
+            price_tick=config.price_tick,
             caps=Caps(max_position=config.max_position, critical_position=config.critical_position),
             risk=RiskConfig(
                 margin_health_soft=config.margin_health_soft,
