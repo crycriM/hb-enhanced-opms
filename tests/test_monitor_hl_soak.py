@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from monitor_hl_soak import (
+    _account_sample,
     _decision_liveness_breach,
     _drawdown_breached,
     _oldest_order_age_s,
@@ -81,3 +82,32 @@ def test_read_only_info_skips_unused_metadata_requests():
         "meta": {"universe": []},
         "spot_meta": {"tokens": [], "universe": []},
     })]
+
+
+def test_account_sample_scopes_positions_and_orders_to_requested_coins():
+    class Info:
+        def user_state(self, address):
+            return {"assetPositions": [
+                {"position": {"coin": "ENA", "szi": "39"}},
+                {"position": {"coin": "ETH", "szi": "1"}},
+            ]}
+
+        def spot_user_state(self, address):
+            return {
+                "balances": [{"coin": "USDC", "total": "300"}],
+                "tokenToAvailableAfterMaintenance": [[0, "250"]],
+            }
+
+        def open_orders(self, address):
+            return [
+                {"coin": "ENA", "timestamp": 99_000},
+                {"coin": "ETH", "timestamp": 98_000},
+            ]
+
+    sample = _account_sample(
+        Info(), "e2_mm1", "0xabc", {"ENA": "0.264"}, {"ENA"}, 3.0, 100.0,
+    )
+
+    assert sample["gross_notional"] == 39 * 0.264
+    assert sample["open_orders"] == 1
+    assert [position["coin"] for position in sample["positions"]] == ["ENA"]
