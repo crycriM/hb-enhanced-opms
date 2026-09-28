@@ -78,13 +78,13 @@ cp -al "$HB_SOURCE/scripts" "$RUNTIME/scripts"
 cp -al "$HB_SOURCE/controllers" "$RUNTIME/controllers"
 cp -a "$HB_SOURCE/conf" "$RUNTIME/conf"
 mkdir -p "$RUNTIME/data" "$RUNTIME/logs"
-cp "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/scripts/$SCRIPT_CONFIG" \
+cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/scripts/$SCRIPT_CONFIG" \
    "$RUNTIME/conf/scripts/"
 for coin in "${COINS[@]}"; do
-  cp "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/controllers/perp_mm_${ACCOUNT_ID}_${coin,,}_soak.yml" \
+  cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/controllers/perp_mm_${ACCOUNT_ID}_${coin,,}_soak.yml" \
      "$RUNTIME/conf/controllers/"
 done
-cp "$REPO/hb-enhanced-opms/deploy/hummingbot/scripts/validate_hb_soak_config.py" \
+cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/scripts/validate_hb_soak_config.py" \
    "$RUNTIME/scripts/"
 
 PASSWORD="${HB_PASSWORD:-}"
