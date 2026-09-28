@@ -33,7 +33,11 @@ def main() -> int:
     parser.add_argument("--leverage", type=int, default=6)
     parser.add_argument("--flat-targets", action="store_true")
     parser.add_argument("--expected-target", action="append", default=[])
-    parser.add_argument("--risk-gates", choices=("enabled", "disabled"), default="disabled")
+    parser.add_argument(
+        "--risk-gates",
+        choices=("enabled", "markout-only", "disabled"),
+        default="disabled",
+    )
     args = parser.parse_args()
     account = args.account_id
     coins = [coin.upper() for coin in args.coins]
@@ -89,6 +93,9 @@ def main() -> int:
     if args.risk_gates == "enabled":
         if any(not c.regime_stop or c.toxic_markout_bps is None for c in controllers):
             raise ValueError("soak must enable regime and toxic-markout gates")
+    elif args.risk_gates == "markout-only":
+        if any(c.regime_stop or c.toxic_markout_bps is None for c in controllers):
+            raise ValueError("soak must disable regime and retain toxic-markout protection")
     else:
         if any(c.regime_stop for c in controllers):
             raise ValueError("soak must have the regime gate disabled for every controller")

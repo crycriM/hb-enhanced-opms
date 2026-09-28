@@ -15,7 +15,7 @@ target_inventory: -39.0
 quote_size: 39.0
 price_tick: 0.00001
 leverage: 3
-regime_stop: true
+regime_stop: false
 toxic_markout_bps: -1.0
 shadow_mode: false
 update_interval: 5.0
