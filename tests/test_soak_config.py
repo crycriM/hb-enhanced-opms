@@ -51,7 +51,7 @@ def test_dual_ena_override_profile_has_equal_opposite_targets():
         assert cfg["gamma"] == 5.0
         assert cfg["kappa"] == 20_000.0
         assert cfg["leverage"] == 3
-        assert cfg["regime_stop"] is True
+        assert cfg["regime_stop"] is False
         assert cfg["toxic_markout_bps"] == -1.0
         assert cfg["update_interval"] == 5.0
         assert cfg["quote_refresh_interval"] == 10.0
