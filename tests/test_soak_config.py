@@ -33,20 +33,25 @@ def test_dual_soak_profile_fits_account_margin_budget_at_critical_caps():
         assert initial_margin_ratio <= 0.75
 
 
-def test_single_ena_override_profile_is_minimum_size_and_flat():
-    cfg = _config("e2_mm1", "ENA")
+def test_dual_ena_override_profile_has_equal_opposite_targets():
+    configs = {
+        account: _config(account, "ENA")
+        for account in ("e2_mm1", "e3_sub1")
+    }
 
-    assert cfg["trading_pair"] == "ENA-USD"
-    assert cfg["account_id"] == "e2_mm1"
-    assert cfg["target_inventory"] == 0.0
-    assert cfg["quote_size"] == 39.0
-    assert cfg["price_tick"] == 0.00001
-    assert cfg["max_position"] == 195.0
-    assert cfg["critical_position"] == 390.0
-    assert cfg["gamma"] == 5.0
-    assert cfg["kappa"] == 20_000.0
-    assert cfg["leverage"] == 3
-    assert cfg["regime_stop"] is True
-    assert cfg["toxic_markout_bps"] == -1.0
-    assert cfg["update_interval"] == 5.0
-    assert cfg["quote_refresh_interval"] == 10.0
+    assert configs["e2_mm1"]["target_inventory"] == 39.0
+    assert configs["e3_sub1"]["target_inventory"] == -39.0
+    for account, cfg in configs.items():
+        assert cfg["trading_pair"] == "ENA-USD"
+        assert cfg["account_id"] == account
+        assert cfg["quote_size"] == 39.0
+        assert cfg["price_tick"] == 0.00001
+        assert cfg["max_position"] == 195.0
+        assert cfg["critical_position"] == 390.0
+        assert cfg["gamma"] == 5.0
+        assert cfg["kappa"] == 20_000.0
+        assert cfg["leverage"] == 3
+        assert cfg["regime_stop"] is True
+        assert cfg["toxic_markout_bps"] == -1.0
+        assert cfg["update_interval"] == 5.0
+        assert cfg["quote_refresh_interval"] == 10.0
