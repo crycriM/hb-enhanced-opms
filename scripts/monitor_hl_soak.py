@@ -79,7 +79,8 @@ def _signal_all(pids: list[int]) -> None:
 
 
 def _account_sample(
-    info, account_id: str, address: str, mids: dict, leverage: float, now: float,
+    info, account_id: str, address: str, mids: dict, coins: set[str],
+    leverage: float, now: float,
 ) -> dict:
     state = info.user_state(address)
     spot = info.spot_user_state(address)
@@ -93,7 +94,7 @@ def _account_sample(
     for entry in state.get("assetPositions", []):
         position = entry.get("position", {})
         coin = position.get("coin")
-        if coin not in {"ETH", "SOL"}:
+        if coin not in coins:
             continue
         szi = float(position.get("szi", 0.0))
         if abs(szi) <= 1e-12:
@@ -101,7 +102,7 @@ def _account_sample(
         mid = float(mids.get(coin, 0.0) or 0.0)
         gross_notional += abs(szi) * mid
         positions.append({"coin": coin, "szi": szi, "mid": mid})
-    open_orders = [o for o in info.open_orders(address) if o.get("coin") in {"ETH", "SOL"}]
+    open_orders = [o for o in info.open_orders(address) if o.get("coin") in coins]
     initial_margin = gross_notional / leverage
     return {
         "account_id": account_id,
@@ -126,6 +127,7 @@ def main(argv=None) -> int:
     ap.add_argument("--max-read-outage-s", type=float, default=45.0)
     ap.add_argument("--max-read-retry-delay-s", type=float, default=20.0)
     ap.add_argument("--leverage", type=float, default=6.0)
+    ap.add_argument("--coins", nargs="+", default=["ETH", "SOL"])
     ap.add_argument("--min-margin-health-ratio", type=float, default=0.15)
     ap.add_argument("--max-initial-margin-ratio", type=float, default=0.85)
     ap.add_argument("--max-drawdown-pct", type=float)
@@ -142,6 +144,7 @@ def main(argv=None) -> int:
     if min(args.interval, args.max_read_outage_s, args.max_read_retry_delay_s) <= 0:
         ap.error("read interval, outage limit, and retry delay must be positive")
     account_ids = args.account_ids or ["e2_mm1"]
+    coins = {coin.upper() for coin in args.coins}
     if len(account_ids) != len(args.pids):
         ap.error("repeat --account-id and --pid once per monitored account")
     if len(set(account_ids)) != len(account_ids):
@@ -194,7 +197,9 @@ def main(argv=None) -> int:
             try:
                 mids = info.all_mids()
                 account_samples = [
-                    _account_sample(info, account_id, address, mids, args.leverage, now)
+                    _account_sample(
+                        info, account_id, address, mids, coins, args.leverage, now,
+                    )
                     for account_id, address in accounts
                 ]
                 equities = [sample["equity"] for sample in account_samples]

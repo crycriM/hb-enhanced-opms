@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Run one bounded real-Hummingbot ETH/SOL MM session on e2_mm1.
+# Run one bounded real-Hummingbot MM session on one account.
 #
 # This is an explicitly gated mainnet write.  It uses a disposable HB runtime,
 # imports only e2_mm1 into that runtime, monitors account margin read-only, then
-# cancels and flattens the scoped ETH/SOL state before returning.
+# cancels and flattens the scoped market state before returning.
 # Diagnostic only: a single-account run cannot exercise the two-account
 # zero-net-USDC STOP_QUOTING target. It can still exercise emergency exits.
 set -euo pipefail
@@ -13,16 +13,21 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 HB_SOURCE="${HB_SOURCE:-/home/christian/sources/hummingbot}"
 PY="${PY:-/home/christian/miniforge3/envs/hummingbot/bin/python}"
 ENV_FILE="${OPMS_ENV_FILE:-$REPO/.env}"
-ACCOUNT_ID=e2_mm1
+ACCOUNT_ID="${ACCOUNT_ID:-e2_mm1}"
+read -r -a COINS <<< "${SOAK_COINS:-ETH SOL}"
+SCRIPT_CONFIG="${SOAK_SCRIPT_CONFIG:-opms_perp_mm_${ACCOUNT_ID}_soak.yml}"
+SOAK_LEVERAGE="${SOAK_LEVERAGE:-6}"
+SOAK_RISK_GATES="${SOAK_RISK_GATES:-disabled}"
 MIN_COLLATERAL="${MIN_COLLATERAL:-600}"
 MAX_DRAWDOWN_PCT="${MAX_DRAWDOWN_PCT:-1.0}"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$REPO/hb-enhanced-opms/logs/live_soak_${STAMP}}"
 COMMON_PYTHONPATH="$REPO/hb-enhanced-opms/src:$REPO/perp-bot/src:$REPO/mm-core/src"
 
-[[ "$DURATION" =~ ^[0-9]+$ && "$DURATION" -gt 0 ]] || {
-  echo "duration must be a positive integer" >&2; exit 2;
+[[ "$DURATION" =~ ^[0-9]+$ && "$DURATION" -gt 0 && "$DURATION" -le 3600 ]] || {
+  echo "duration must be 1..3600 seconds" >&2; exit 2;
 }
+[[ "${#COINS[@]}" -gt 0 ]] || { echo "at least one soak coin is required" >&2; exit 2; }
 [[ "${OPMS_HB_MAINNET:-}" == "confirm" ]] || {
   echo "refusing mainnet connectors: set OPMS_HB_MAINNET=confirm" >&2; exit 2;
 }
@@ -38,17 +43,13 @@ COMMON_PYTHONPATH="$REPO/hb-enhanced-opms/src:$REPO/perp-bot/src:$REPO/mm-core/s
 mkdir -p "$ARTIFACT_DIR"
 PREflight="$ARTIFACT_DIR/preflight.json"
 "$PY" "$REPO/hb-enhanced-opms/scripts/check_hl_account_state.py" \
-  --account-id "$ACCOUNT_ID" --coins ETH SOL --require-clean \
+  --account-id "$ACCOUNT_ID" --coins "${COINS[@]}" --require-clean \
   --min-equity "$MIN_COLLATERAL" --output "$PREflight"
 
-if [[ -f "$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_eth_soak.decisions.jsonl" ]]; then
-  mv "$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_eth_soak.decisions.jsonl" \
-     "$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_eth_soak.decisions.$STAMP.jsonl"
-fi
-if [[ -f "$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_sol_soak.decisions.jsonl" ]]; then
-  mv "$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_sol_soak.decisions.jsonl" \
-     "$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_sol_soak.decisions.$STAMP.jsonl"
-fi
+for coin in "${COINS[@]}"; do
+  log="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_${ACCOUNT_ID}_${coin,,}_soak.decisions.jsonl"
+  [[ -f "$log" ]] && mv "$log" "${log%.jsonl}.${STAMP}.jsonl"
+done
 
 REMOVE_BASE=0
 if [[ -z "${RUNTIME_BASE:-}" ]]; then
@@ -77,11 +78,12 @@ cp -al "$HB_SOURCE/scripts" "$RUNTIME/scripts"
 cp -al "$HB_SOURCE/controllers" "$RUNTIME/controllers"
 cp -a "$HB_SOURCE/conf" "$RUNTIME/conf"
 mkdir -p "$RUNTIME/data" "$RUNTIME/logs"
-cp "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/scripts/opms_perp_mm_e2_mm1_soak.yml" \
+cp "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/scripts/$SCRIPT_CONFIG" \
    "$RUNTIME/conf/scripts/"
-cp "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/controllers/perp_mm_e2_mm1_eth_soak.yml" \
-   "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/controllers/perp_mm_e2_mm1_sol_soak.yml" \
-   "$RUNTIME/conf/controllers/"
+for coin in "${COINS[@]}"; do
+  cp "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/controllers/perp_mm_${ACCOUNT_ID}_${coin,,}_soak.yml" \
+     "$RUNTIME/conf/controllers/"
+done
 cp "$REPO/hb-enhanced-opms/deploy/hummingbot/scripts/validate_hb_soak_config.py" \
    "$RUNTIME/scripts/"
 
@@ -99,8 +101,11 @@ fi
 )
 (
   cd "$RUNTIME"
+  VALIDATE_ARGS=(--account-id "$ACCOUNT_ID" --script-config "$SCRIPT_CONFIG"
+    --coins "${COINS[@]}" --leverage "$SOAK_LEVERAGE" --risk-gates "$SOAK_RISK_GATES")
+  [[ "${SOAK_FLAT_TARGETS:-}" == 1 ]] && VALIDATE_ARGS+=(--flat-targets)
   OPMS_ENV_FILE="$ENV_FILE" PYTHONPATH="$RUNTIME:$COMMON_PYTHONPATH" \
-    "$PY" "$RUNTIME/scripts/validate_hb_soak_config.py"
+    "$PY" "$RUNTIME/scripts/validate_hb_soak_config.py" "${VALIDATE_ARGS[@]}"
 )
 
 if [[ "${OPMS_HB_DRY_RUN:-}" == "1" ]]; then
@@ -109,16 +114,15 @@ if [[ "${OPMS_HB_DRY_RUN:-}" == "1" ]]; then
   exit 0
 fi
 
-LOG_ETH="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_eth_soak.decisions.jsonl"
-LOG_SOL="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_sol_soak.decisions.jsonl"
-mkdir -p "$(dirname "$LOG_ETH")"
+LOG_DIR="$REPO/hb-enhanced-opms/logs/hb_soak"
+mkdir -p "$LOG_DIR"
 
 echo "warning: single-account diagnostic; cross-account USDC-flat stop is unavailable" >&2
 echo "starting e2_mm1 live soak: duration=${DURATION}s artifact_dir=$ARTIFACT_DIR"
 (
   cd "$RUNTIME"
   exec env OPMS_ENV_FILE="$ENV_FILE" CONFIG_PASSWORD="$PASSWORD" \
-    SCRIPT_CONFIG=opms_perp_mm_e2_mm1_soak.yml \
+    SCRIPT_CONFIG="$SCRIPT_CONFIG" \
     PYTHONPATH="$RUNTIME/bin:$RUNTIME:$COMMON_PYTHONPATH" \
     timeout --signal=INT --kill-after=60 "$DURATION" \
       "$PY" "$REPO/hb-enhanced-opms/deploy/hummingbot/scripts/run_hummingbot_isolated.py"
@@ -126,10 +130,17 @@ echo "starting e2_mm1 live soak: duration=${DURATION}s artifact_dir=$ARTIFACT_DI
 HB_PID=$!
 
 set +e
-"$PY" "$REPO/hb-enhanced-opms/scripts/monitor_hl_soak.py" \
+MONITOR_ARGS=(
   --account-id "$ACCOUNT_ID" --pid "$HB_PID" --duration "$DURATION" \
-  --max-drawdown-pct "$MAX_DRAWDOWN_PCT" \
-  --output "$ARTIFACT_DIR/monitor.jsonl" >"$ARTIFACT_DIR/monitor.log" 2>&1 &
+  --coins "${COINS[@]}" --leverage "$SOAK_LEVERAGE"
+  --max-drawdown-pct "$MAX_DRAWDOWN_PCT"
+  --output "$ARTIFACT_DIR/monitor.jsonl"
+)
+for coin in "${COINS[@]}"; do
+  MONITOR_ARGS+=(--decision-log "$ACCOUNT_ID:$coin=$LOG_DIR/perp_mm_${ACCOUNT_ID}_${coin,,}_soak.decisions.jsonl")
+done
+"$PY" "$REPO/hb-enhanced-opms/scripts/monitor_hl_soak.py" \
+  "${MONITOR_ARGS[@]}" >"$ARTIFACT_DIR/monitor.log" 2>&1 &
 MON_PID=$!
 wait "$HB_PID"
 HB_STATUS=$?
@@ -144,19 +155,21 @@ fi
 
 set +e
 "$PY" "$REPO/hb-enhanced-opms/scripts/cleanup_hl_soak.py" \
-  --account-id "$ACCOUNT_ID" --coins ETH SOL --allow-cleanup \
+  --account-id "$ACCOUNT_ID" --coins "${COINS[@]}" --allow-cleanup \
   --output "$ARTIFACT_DIR/cleanup.json"
 CLEAN_STATUS=$?
 "$PY" "$REPO/hb-enhanced-opms/scripts/check_hl_account_state.py" \
-  --account-id "$ACCOUNT_ID" --coins ETH SOL --require-clean \
+  --account-id "$ACCOUNT_ID" --coins "${COINS[@]}" --require-clean \
   --output "$ARTIFACT_DIR/postflight.json"
 POST_STATUS=$?
 set -e
 
-if [[ ! -s "$LOG_ETH" || ! -s "$LOG_SOL" ]]; then
-  echo "live soak did not produce both decision logs" >&2
-  HB_STATUS=1
-fi
+for coin in "${COINS[@]}"; do
+  [[ -s "$LOG_DIR/perp_mm_${ACCOUNT_ID}_${coin,,}_soak.decisions.jsonl" ]] || {
+    echo "live soak did not produce the $coin decision log" >&2
+    HB_STATUS=1
+  }
+done
 
 is_expected_stop() {
   [[ "$1" -eq 0 || "$1" -eq 124 || "$1" -eq 130 || "$1" -eq 143 ]]
@@ -167,5 +180,5 @@ if ! is_expected_stop "$HB_STATUS" || [[ "$MON_STATUS" -ne 0 || "$CLEAN_STATUS" 
   exit 1
 fi
 
-echo "e2_mm1 live soak passed: ${DURATION}s, ETH/SOL, 6x, clean teardown"
+echo "$ACCOUNT_ID live soak passed: ${DURATION}s, ${COINS[*]}, ${SOAK_LEVERAGE}x, clean teardown"
 echo "artifacts: $ARTIFACT_DIR"
