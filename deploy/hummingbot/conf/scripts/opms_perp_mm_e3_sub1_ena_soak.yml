@@ -1,0 +1,3 @@
+script_file_name: opms_perp_mm.py
+controllers_config:
+  - perp_mm_e3_sub1_ena_soak.yml

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bounded two-account ETH/SOL mainnet soak. Defaults to one hour.
+# Bounded two-account mainnet soak. Defaults to one hour.
 set -euo pipefail
 
 DURATION="${1:-3600}"
@@ -14,13 +14,33 @@ MAX_DECISION_AGE_S="${MAX_DECISION_AGE_S:-30}"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$REPO/hb-enhanced-opms/logs/live_dual_soak_${STAMP}}"
 COMMON_PYTHONPATH="$REPO/hb-enhanced-opms/src:$REPO/perp-bot/src:$REPO/mm-core/src"
-PORTFOLIO_MEMBERS="e2_mm1:ETH,e2_mm1:SOL,e3_sub1:ETH,e3_sub1:SOL"
 ACCOUNTS=(e2_mm1 e3_sub1)
-COINS=(eth sol)
+read -r -a COINS <<< "${SOAK_COINS:-ETH SOL}"
+SOAK_CONFIG_TAG="${SOAK_CONFIG_TAG:-}"
+SOAK_LEVERAGE="${SOAK_LEVERAGE:-6}"
+SOAK_RISK_GATES="${SOAK_RISK_GATES:-disabled}"
+SOAK_TARGET_ABS="${SOAK_TARGET_ABS:-}"
+members=()
+for account in "${ACCOUNTS[@]}"; do
+  for coin in "${COINS[@]}"; do
+    members+=("$account:${coin^^}")
+  done
+done
+PORTFOLIO_MEMBERS="$(IFS=,; echo "${members[*]}")"
+
+script_config() {
+  local account="$1"
+  if [[ -n "$SOAK_CONFIG_TAG" ]]; then
+    echo "opms_perp_mm_${account}_${SOAK_CONFIG_TAG}_soak.yml"
+  else
+    echo "opms_perp_mm_${account}_soak.yml"
+  fi
+}
 
 [[ "$DURATION" =~ ^[0-9]+$ && "$DURATION" -gt 0 && "$DURATION" -le 3600 ]] || {
   echo "duration must be 1..3600 seconds" >&2; exit 2;
 }
+[[ "${#COINS[@]}" -gt 0 ]] || { echo "at least one soak coin is required" >&2; exit 2; }
 [[ "${OPMS_HB_MAINNET:-}" == confirm && "${OPMS_HB_PLACE_ORDERS:-}" == confirm ]] || {
   echo "refusing live mainnet orders: set OPMS_HB_MAINNET=confirm and OPMS_HB_PLACE_ORDERS=confirm" >&2
   exit 2
@@ -54,7 +74,7 @@ PY
 mkdir -p "$ARTIFACT_DIR"
 for account in "${ACCOUNTS[@]}"; do
   if ! "$PY" "$REPO/hb-enhanced-opms/scripts/check_hl_account_state.py" \
-    --account-id "$account" --coins ETH SOL --require-clean \
+    --account-id "$account" --coins "${COINS[@]}" --require-clean \
     --min-equity "$MIN_COLLATERAL" --output "$ARTIFACT_DIR/${account}_preflight.json" \
     >"$ARTIFACT_DIR/${account}_preflight.log"; then
     echo "$account preflight failed: $ARTIFACT_DIR/${account}_preflight.json" >&2
@@ -98,12 +118,12 @@ finish() {
   if [[ "$STARTED" -eq 1 ]]; then
     for account in "${ACCOUNTS[@]}"; do
       "$PY" "$REPO/hb-enhanced-opms/scripts/cleanup_hl_soak.py" \
-        --account-id "$account" --coins ETH SOL --allow-cleanup \
+        --account-id "$account" --coins "${COINS[@]}" --allow-cleanup \
         --output "$ARTIFACT_DIR/${account}_cleanup.json" \
         >"$ARTIFACT_DIR/${account}_cleanup.log" 2>&1
       cleanup_status=$?
       "$PY" "$REPO/hb-enhanced-opms/scripts/check_hl_account_state.py" \
-        --account-id "$account" --coins ETH SOL --require-clean \
+        --account-id "$account" --coins "${COINS[@]}" --require-clean \
         --output "$ARTIFACT_DIR/${account}_postflight.json" \
         >"$ARTIFACT_DIR/${account}_postflight.log" 2>&1
       post_status=$?
@@ -116,7 +136,7 @@ finish() {
         status=1
       fi
       for coin in "${COINS[@]}"; do
-        log="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_${account}_${coin}_soak.decisions.jsonl"
+        log="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_${account}_${coin,,}_soak.decisions.jsonl"
         if [[ -s "$log" ]]; then
           cp "$log" "$ARTIFACT_DIR/"
         else
@@ -128,7 +148,7 @@ finish() {
   fi
   rm -rf "$RUNTIME_BASE"
   if [[ "$status" -eq 0 && "$COMPLETED" -eq 1 ]]; then
-    echo "dual live soak passed: ${DURATION}s, ETH/SOL on both accounts, clean teardown"
+    echo "dual live soak passed: ${DURATION}s, ${COINS[*]} on both accounts, clean teardown"
   elif [[ "$status" -ne 0 ]]; then
     echo "dual live soak failed; inspect artifacts and both accounts" >&2
   fi
@@ -148,10 +168,11 @@ for account in "${ACCOUNTS[@]}"; do
   cp -al "$HB_SOURCE/controllers" "$runtime/controllers"
   cp -a "$HB_SOURCE/conf" "$runtime/conf"
   mkdir -p "$runtime/data" "$runtime/logs"
-  cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/scripts/opms_perp_mm_${account}_soak.yml" \
+  config_name="$(script_config "$account")"
+  cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/scripts/$config_name" \
     "$runtime/conf/scripts/"
   for coin in "${COINS[@]}"; do
-    cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/controllers/perp_mm_${account}_${coin}_soak.yml" \
+    cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/controllers/perp_mm_${account}_${coin,,}_soak.yml" \
       "$runtime/conf/controllers/"
   done
   cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/scripts/validate_hb_soak_config.py" \
@@ -161,13 +182,23 @@ done
 PASSWORD="${HB_PASSWORD:-$($PY -c 'import secrets; print(secrets.token_urlsafe(32))')}"
 for account in "${ACCOUNTS[@]}"; do
   runtime="$RUNTIME_BASE/$account"
+  config_name="$(script_config "$account")"
   (
     cd "$runtime"
     OPMS_ENV_FILE="$ENV_FILE" HB_PASSWORD="$PASSWORD" PYTHONPATH="$runtime:$COMMON_PYTHONPATH" \
       "$PY" "$REPO/hb-enhanced-opms/scripts/import_hl_mainnet_credentials.py" \
         --account-id "$account"
+    VALIDATE_ARGS=(--account-id "$account" --script-config "$config_name"
+      --coins "${COINS[@]}" --leverage "$SOAK_LEVERAGE" --risk-gates "$SOAK_RISK_GATES")
+    if [[ -n "$SOAK_TARGET_ABS" ]]; then
+      for coin in "${COINS[@]}"; do
+        target="$SOAK_TARGET_ABS"
+        [[ "$account" == "e3_sub1" ]] && target="-$target"
+        VALIDATE_ARGS+=(--expected-target "${coin^^}-USD=$target")
+      done
+    fi
     OPMS_ENV_FILE="$ENV_FILE" PYTHONPATH="$runtime:$COMMON_PYTHONPATH" \
-      "$PY" "$runtime/scripts/validate_hb_soak_config.py" --account-id "$account"
+      "$PY" "$runtime/scripts/validate_hb_soak_config.py" "${VALIDATE_ARGS[@]}"
   )
 done
 
@@ -179,19 +210,20 @@ fi
 mkdir -p "$REPO/hb-enhanced-opms/logs/hb_soak"
 for account in "${ACCOUNTS[@]}"; do
   for coin in "${COINS[@]}"; do
-    log="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_${account}_${coin}_soak.decisions.jsonl"
+    log="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_${account}_${coin,,}_soak.decisions.jsonl"
     [[ -f "$log" ]] && mv "$log" "${log%.jsonl}.${STAMP}.jsonl"
   done
 done
 
 run_instance() {
-  local account="$1" runtime="$RUNTIME_BASE/$1"
+  local account="$1" runtime="$RUNTIME_BASE/$1" config_name
+  config_name="$(script_config "$account")"
   (
     cd "$runtime"
     exec env OPMS_ENV_FILE="$ENV_FILE" CONFIG_PASSWORD="$PASSWORD" \
       OPMS_PORTFOLIO_STOP_DB="$RUNTIME_BASE/portfolio_stop.db" \
       OPMS_PORTFOLIO_MEMBERS="$PORTFOLIO_MEMBERS" \
-      SCRIPT_CONFIG="opms_perp_mm_${account}_soak.yml" \
+      SCRIPT_CONFIG="$config_name" \
       PYTHONPATH="$runtime/bin:$runtime:$COMMON_PYTHONPATH" \
       timeout --signal=INT --kill-after=60 "$((DURATION + 120))" \
         "$PY" "$REPO/hb-enhanced-opms/deploy/hummingbot/scripts/run_hummingbot_isolated.py"
@@ -204,17 +236,21 @@ STARTED=1
 for account in "${ACCOUNTS[@]}"; do
   run_instance "$account"
 done
-"$PY" "$REPO/hb-enhanced-opms/scripts/monitor_hl_soak.py" \
+MONITOR_ARGS=(
   --account-id e2_mm1 --pid "${HB_PID[e2_mm1]}" \
   --account-id e3_sub1 --pid "${HB_PID[e3_sub1]}" \
-  --duration "$DURATION" --max-drawdown-pct "$MAX_DRAWDOWN_PCT" \
-  --max-order-age-s "$MAX_ORDER_AGE_S" --max-decision-age-s "$MAX_DECISION_AGE_S" \
-  --decision-log "e2_mm1:ETH=$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_eth_soak.decisions.jsonl" \
-  --decision-log "e2_mm1:SOL=$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_sol_soak.decisions.jsonl" \
-  --decision-log "e3_sub1:ETH=$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e3_sub1_eth_soak.decisions.jsonl" \
-  --decision-log "e3_sub1:SOL=$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_e3_sub1_sol_soak.decisions.jsonl" \
-  --output "$ARTIFACT_DIR/combined_monitor.jsonl" \
-  >"$ARTIFACT_DIR/combined_monitor.log" 2>&1 &
+  --duration "$DURATION" --coins "${COINS[@]}" --leverage "$SOAK_LEVERAGE"
+  --max-drawdown-pct "$MAX_DRAWDOWN_PCT"
+  --max-order-age-s "$MAX_ORDER_AGE_S" --max-decision-age-s "$MAX_DECISION_AGE_S"
+  --output "$ARTIFACT_DIR/combined_monitor.jsonl"
+)
+for account in "${ACCOUNTS[@]}"; do
+  for coin in "${COINS[@]}"; do
+    MONITOR_ARGS+=(--decision-log "$account:${coin^^}=$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_${account}_${coin,,}_soak.decisions.jsonl")
+  done
+done
+"$PY" "$REPO/hb-enhanced-opms/scripts/monitor_hl_soak.py" \
+  "${MONITOR_ARGS[@]}" >"$ARTIFACT_DIR/combined_monitor.log" 2>&1 &
 MON_PID=$!
 
 start_ts=$(date +%s)
@@ -238,7 +274,7 @@ while (( $(date +%s) < deadline )); do
         exit 1
       fi
       for coin in "${COINS[@]}"; do
-        log="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_${account}_${coin}_soak.decisions.jsonl"
+        log="$REPO/hb-enhanced-opms/logs/hb_soak/perp_mm_${account}_${coin,,}_soak.decisions.jsonl"
         [[ -s "$log" ]] || { echo "$account/$coin produced no decisions in 90 seconds" >&2; exit 1; }
       done
     done

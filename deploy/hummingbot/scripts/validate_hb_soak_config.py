@@ -32,6 +32,7 @@ def main() -> int:
     parser.add_argument("--coins", nargs="+", default=["ETH", "SOL"])
     parser.add_argument("--leverage", type=int, default=6)
     parser.add_argument("--flat-targets", action="store_true")
+    parser.add_argument("--expected-target", action="append", default=[])
     parser.add_argument("--risk-gates", choices=("enabled", "disabled"), default="disabled")
     args = parser.parse_args()
     account = args.account_id
@@ -64,7 +65,16 @@ def main() -> int:
     if {c.trading_pair for c in controllers} != expected_pairs:
         raise ValueError("unexpected soak trading pairs")
     targets = {c.trading_pair: c.target_inventory for c in controllers}
-    if args.flat_targets:
+    if args.expected_target:
+        expected = {}
+        for value in args.expected_target:
+            if "=" not in value:
+                parser.error("--expected-target must be PAIR=VALUE")
+            pair, target = value.split("=", 1)
+            expected[pair] = float(target)
+        if targets != expected:
+            raise ValueError(f"unexpected soak targets: {targets!r}")
+    elif args.flat_targets:
         if any(abs(target) > 1e-12 for target in targets.values()):
             raise ValueError(f"single-market soak targets must be flat: {targets!r}")
     else:

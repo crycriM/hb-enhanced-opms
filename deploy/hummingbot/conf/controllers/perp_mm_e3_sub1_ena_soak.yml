@@ -1,17 +1,17 @@
-# Explicit failed-gate override: bounded dual-account ENA long leg.
-id: perp_mm_e2_mm1_ena_soak
+# Explicit failed-gate override: bounded dual-account ENA short leg.
+id: perp_mm_e3_sub1_ena_soak
 controller_name: perp_mm
 controller_type: generic
 connector_name: hyperliquid_perpetual
 trading_pair: ENA-USD
 venue: hyperliquid
-account_id: e2_mm1
+account_id: e3_sub1
 gamma: 5.0
 kappa: 20000.0
 widen_factor: 2.0
 max_position: 195.0
 critical_position: 390.0
-target_inventory: 39.0
+target_inventory: -39.0
 quote_size: 39.0
 price_tick: 0.00001
 leverage: 3
@@ -28,4 +28,4 @@ venue_failure_threshold: 3
 venue_backoff_initial: 2.0
 venue_backoff_max: 60.0
 control_cycle_timeout: 15.0
-decision_log_path: /home/christian/Python/github/amm-solution/hb-enhanced-opms/logs/hb_soak/perp_mm_e2_mm1_ena_soak.decisions.jsonl
+decision_log_path: /home/christian/Python/github/amm-solution/hb-enhanced-opms/logs/hb_soak/perp_mm_e3_sub1_ena_soak.decisions.jsonl
