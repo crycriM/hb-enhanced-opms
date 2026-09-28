@@ -184,6 +184,7 @@ class DLMMController(ControllerBase):
                 last.inventory_base + last.inventory_quote / last.mid if last.mid > 0 else 0.0
             )
             self._shared_book.dlmm_sigma = last.sigma
+            self._shared_book.dlmm_mid = last.mid
             self._shared_book.last_dlmm_ts = last.ts
 
     def determine_executor_actions(self) -> List[ExecutorAction]:

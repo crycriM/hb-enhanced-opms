@@ -5,6 +5,7 @@ class SharedRiskBook:
     dlmm_net_delta: float = 0.0
     dlmm_inventory_value_usd: float = 0.0
     dlmm_sigma: float = 0.0
+    dlmm_mid: float = 0.0
     hedge_action: str = "no_trade"
     hedge_target_short: float = 0.0
     hedge_urgency: str = "normal"

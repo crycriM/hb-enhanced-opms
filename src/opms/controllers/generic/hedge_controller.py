@@ -36,7 +36,7 @@ class HedgeControllerConfig(ControllerConfigBase):
     sigma_ref: float = 0.5
     deadband_base_bps: float = 10.0
     per_trade_cost_bps: float = 2.0
-    delta_cap_bps: float = 200.0
+    delta_cap_bps: float = 1200.0
     cube_root_constant: float = 1.0
     deadband_base: float = 0.0
     refresh_interval: float = 5.0
@@ -83,8 +83,9 @@ class HedgeController(ControllerBase):
 
         action, target, _ = self._hedge.evaluate(
             inventory_base=inv_base,
-            current_short=perp_position,
+            current_short=-perp_position,  # perp position is signed; short > 0 here
             inventory_value_usd=inv_value,
+            price=self._shared_book.dlmm_mid,
             sigma_now=sigma,
             dt=self.config.refresh_interval,
         )
