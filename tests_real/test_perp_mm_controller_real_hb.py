@@ -567,6 +567,54 @@ def test_stale_book_cancels_quotes_allows_flatten_and_recovers(monkeypatch):
     assert all(isinstance(action, CreateExecutorAction) for action in recovered)
 
 
+def test_stale_book_cancellation_is_bounded(monkeypatch):
+    import opms.controllers.generic.perp_mm_controller as controller_module
+    from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+
+    md = _MarketDataWithBookMetrics(last_diff=100.0)
+    md.now = 100.0
+    md.time = lambda: md.now
+    ctrl = _controller(md)
+    ctrl.config = _config(
+        max_market_data_age_s=2.0,
+        quote_liveness_timeout=10.0,
+        quote_recovery_cooldown=30.0,
+    )
+    monkeypatch.setattr(controller_module.time, "perf_counter", lambda: 100.0)
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", account_id="e2_mm1",
+        target_inventory=0.0, current_inventory=0.0,
+        quote=QuoteSpec(bid_price=2999.0, ask_price=3001.0,
+                        bid_size=0.01, ask_size=0.01),
+        urgency="passive",
+    )
+    created = ctrl.determine_executor_actions()
+    _with_active(ctrl, [
+        _ExecInfo(f"q-{i}", action.executor_config, {"order_id": f"oid-{i}"})
+        for i, action in enumerate(created)
+    ])
+
+    md.pair_metrics.last_diff_timestamp = 97.0
+    stopping = ctrl.determine_executor_actions()
+    assert len(stopping) == 2
+    assert all(isinstance(action, StopExecutorAction) for action in stopping)
+    assert ctrl._quote_refresh_pending is True
+
+    md.now += 10.0
+    timed_out = ctrl.determine_executor_actions()
+    assert len(timed_out) == 2
+    assert all(isinstance(action, StopExecutorAction) for action in timed_out)
+    assert ctrl._quote_liveness.snapshot(md.now)["state"] == "open"
+    assert ctrl._quote_refresh_pending is False
+    assert ctrl._last_quote_refresh_reason == "cancel_timeout"
+
+    _with_active(ctrl, [])
+    md.pair_metrics.last_diff_timestamp = 100.0
+    assert ctrl.determine_executor_actions() == []
+    md.now += 30.0
+    assert len(ctrl.determine_executor_actions()) == 2
+
+
 def test_stale_quote_liveness_trips_to_reduce_only_flatten():
     from hummingbot.core.data_type.common import TradeType
     from hummingbot.strategy_v2.models.executor_actions import (
