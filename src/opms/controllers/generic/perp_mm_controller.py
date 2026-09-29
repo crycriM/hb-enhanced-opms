@@ -674,9 +674,18 @@ class PerpMMController(ControllerBase):
                 and self._market_data_age_s() > max_data_age):
             self._last_quote_refresh_reason = "stale_market_data"
             self._quote_liveness.suspend()
+            quote_active = [e for e in active if self._is_quote_executor(e)]
+            now = self.market_data_provider.time()
+            if (quote_active and not self._quote_refresh_pending
+                    and self._quote_liveness.allow_quotes(now)):
+                self._quote_refresh_pending = True
+                self._quote_cancel_started_at = now
+            if self._quote_refresh_pending:
+                sides = {self._quote_side(e.config.side) for e in quote_active}
+                self._cancel_timed_out(now, sides, self._live_quote_sides(quote_active))
             # Do not block a risk-reducing executor on a stale public book.
             return [StopExecutorAction(controller_id=self.config.id, executor_id=e.id)
-                    for e in active if self._is_quote_executor(e)]
+                    for e in quote_active]
 
         if intent_is_quoting(self._client.last_intent):
             specs = self._executable_quote_specs(
@@ -699,23 +708,7 @@ class PerpMMController(ControllerBase):
                     # lack of venue ids is planned, not a liveness incident.
                     self._quote_liveness.suspend()
                     started = getattr(self, "_quote_cancel_started_at", None)
-                    cancel_timed_out = (
-                        active and started is not None
-                        and now - started >= self.config.quote_liveness_timeout
-                    )
-                    if cancel_timed_out:
-                        self._last_cancel_latency_s = now - started
-                        self._last_quote_refresh_reason = "cancel_timeout"
-                        self._quote_refresh_pending = False
-                        self._quote_cancel_started_at = None
-                        self._quote_liveness.trip(now, expected, live)
-                        logger.error(
-                            "%s quote cancellation timed out after %.3fs",
-                            self.config.trading_pair, self._last_cancel_latency_s,
-                        )
-                        self._publish_portfolio_emergency(
-                            float(self._current_base_position())
-                        )
+                    if active and self._cancel_timed_out(now, expected, live):
                         new_actions = []
                     elif active:
                         new_actions = []
@@ -806,6 +799,22 @@ class PerpMMController(ControllerBase):
             for e in active if e.id not in keep
         ]
         return stops + new_actions
+
+    def _cancel_timed_out(self, now, expected, live) -> bool:
+        started = getattr(self, "_quote_cancel_started_at", None)
+        if started is None or now - started < self.config.quote_liveness_timeout:
+            return False
+        self._last_cancel_latency_s = now - started
+        self._last_quote_refresh_reason = "cancel_timeout"
+        self._quote_refresh_pending = False
+        self._quote_cancel_started_at = None
+        self._quote_liveness.trip(now, expected, live)
+        logger.error(
+            "%s quote cancellation timed out after %.3fs",
+            self.config.trading_pair, self._last_cancel_latency_s,
+        )
+        self._publish_portfolio_emergency(float(self._current_base_position()))
+        return True
 
     def _market_data_age_s(self) -> float:
         connector = self.market_data_provider.get_connector(self.config.connector_name)
