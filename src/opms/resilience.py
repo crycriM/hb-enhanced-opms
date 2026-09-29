@@ -183,6 +183,19 @@ class QuoteLivenessWatchdog:
         self.expected_sides = ()
         self.live_sides = ()
 
+    def trip(
+        self,
+        now: float,
+        expected_sides: Iterable[str] = (),
+        live_sides: Iterable[str] = (),
+    ) -> None:
+        """Open the circuit immediately for an explicit liveness failure."""
+        self.expected_sides = tuple(sorted(set(expected_sides)))
+        self.live_sides = tuple(sorted(set(live_sides)))
+        self.missing_since = None
+        self.trips += 1
+        self.open_until = max(self.open_until, now + self.recovery_cooldown_s)
+
     def snapshot(self, now: float) -> dict:
         if not self.allow_quotes(now):
             state = "open"

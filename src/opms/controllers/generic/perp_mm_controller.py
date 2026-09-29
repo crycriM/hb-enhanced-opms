@@ -684,10 +684,34 @@ class PerpMMController(ControllerBase):
                     # Old quote executors are shutting down. Their temporary
                     # lack of venue ids is planned, not a liveness incident.
                     self._quote_liveness.suspend()
-                    if active:
+                    started = getattr(self, "_quote_cancel_started_at", None)
+                    cancel_timed_out = (
+                        active and started is not None
+                        and now - started >= self.config.quote_liveness_timeout
+                    )
+                    if cancel_timed_out:
+                        self._last_cancel_latency_s = now - started
+                        self._last_quote_refresh_reason = "cancel_timeout"
+                        self._quote_refresh_pending = False
+                        self._quote_cancel_started_at = None
+                        self._quote_liveness.trip(now, expected, live)
+                        logger.error(
+                            "%s quote cancellation timed out after %.3fs",
+                            self.config.trading_pair, self._last_cancel_latency_s,
+                        )
+                        self._publish_portfolio_emergency(
+                            float(self._current_base_position())
+                        )
+                        new_actions = []
+                    elif active:
                         new_actions = []
                     else:
                         self._quote_refresh_pending = False
+                        if started is not None:
+                            self._last_cancel_latency_s = now - started
+                            logger.info("%s quote_cancel_to_inactive_s=%.3f", self.config.trading_pair,
+                                        self._last_cancel_latency_s)
+                            self._quote_cancel_started_at = None
                         new_actions = self._quote_create_actions(specs, now)
                 else:
                     tripped = (
@@ -734,6 +758,7 @@ class PerpMMController(ControllerBase):
                             keep = {e.id for e in active}
                         else:
                             self._quote_refresh_pending = True
+                            self._quote_cancel_started_at = now
                             self._quote_liveness.suspend()
                         new_actions = []
                     else:
@@ -883,4 +908,6 @@ class PerpMMController(ControllerBase):
             "slippage": self._fill_observer.slippage_stats(),
             "quote_liveness": self._quote_liveness.snapshot(now),
             "venue_circuit": self._venue_circuit.snapshot(now),
+            "quote_refresh_reason": getattr(self, "_last_quote_refresh_reason", None),
+            "quote_cancel_to_inactive_s": getattr(self, "_last_cancel_latency_s", None),
         }
