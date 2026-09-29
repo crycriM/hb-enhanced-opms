@@ -131,16 +131,15 @@ class FillObserver:
         if event.trading_pair != self.symbol:
             return
 
-        ts = time.time()
-        self.last_fill_ts = ts
+        ts = float(event.timestamp)
+        self.last_fill_ts = time.time()  # receipt time drives position reconciliation
         side = "buy" if event.trade_type == TradeType.BUY else "sell"
         price = float(event.price)
         size = float(event.amount)
-        fee = float(
-            event.trade_fee.flat_fees[0].amount
-            if event.trade_fee.flat_fees
-            else Decimal("0")
-        )
+        fee = float(event.trade_fee.fee_amount_in_token(
+            trading_pair=event.trading_pair, price=event.price,
+            order_amount=event.amount, token=event.trading_pair.split("-")[1],
+        ))
 
         # Mid at fill — use the most recently observed mid.
         mid_at_fill = self._last_mid

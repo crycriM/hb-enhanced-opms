@@ -32,9 +32,11 @@ def _make_fill_event(order_id: str, trading_pair: str, side: str, price: float, 
     event.trade_type = TradeType.BUY if side == "buy" else TradeType.SELL
     event.price = Decimal(str(price))
     event.amount = Decimal(str(amount))
+    event.timestamp = time.time()
     # flat_fees empty → fee = 0
     event.trade_fee = MagicMock()
     event.trade_fee.flat_fees = []
+    event.trade_fee.fee_amount_in_token.return_value = Decimal("0")
     return event
 
 
@@ -82,6 +84,7 @@ class TestFillObserverFillAccounting:
         observer.update_mid(100.0)
         event = _make_fill_event("ord1", "SOL-PERP", "buy", 100.0, 1.0)
         event.trade_fee.flat_fees = [MagicMock(amount=Decimal("0.015"))]
+        event.trade_fee.fee_amount_in_token.return_value = Decimal("0.015")
         observer._on_fill_event(0, None, event)
         keeper._apply_positions({"SOL": Position(
             coin="SOL", position=1.0, equity=100.0, margin_available=100.0,
