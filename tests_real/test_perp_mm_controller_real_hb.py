@@ -433,7 +433,11 @@ def test_quote_refresh_cancels_before_creating_replacements():
 
     md = _ClockedMarketData()
     ctrl = _controller(md)
-    ctrl.config = _config(quote_refresh_interval=5.0)
+    ctrl.config = _config(
+        quote_refresh_interval=5.0,
+        quote_liveness_timeout=10.0,
+        quote_recovery_cooldown=30.0,
+    )
     ctrl._client.last_intent = ExecIntent(
         venue="hyperliquid", coin="ETH", account_id="e2_mm1",
         target_inventory=0.0, current_inventory=0.0,
@@ -451,14 +455,24 @@ def test_quote_refresh_cancels_before_creating_replacements():
     assert sum(isinstance(a, StopExecutorAction) for a in actions) == 2
     assert not any(isinstance(a, CreateExecutorAction) for a in actions)
 
-    # A slow cancel acknowledgement is part of the planned two-phase refresh,
-    # not missing-quote evidence. It must not trigger the flatten watchdog.
-    md.now += 30.0
+    # A slow acknowledgement gets one bounded grace window. Beyond it the
+    # circuit opens instead of suspending cancellation liveness forever.
+    md.now += 9.0
     still_stopping = ctrl.determine_executor_actions()
     assert sum(isinstance(a, StopExecutorAction) for a in still_stopping) == 2
     assert not any(isinstance(a, CreateExecutorAction) for a in still_stopping)
+    assert ctrl._quote_liveness.snapshot(md.now)["state"] != "open"
+
+    md.now += 1.0
+    timed_out = ctrl.determine_executor_actions()
+    assert sum(isinstance(a, StopExecutorAction) for a in timed_out) == 2
+    assert not any(isinstance(a, CreateExecutorAction) for a in timed_out)
+    assert ctrl._quote_liveness.snapshot(md.now)["state"] == "open"
+    assert ctrl._quote_refresh_pending is False
 
     _with_active(ctrl, [])
+    assert ctrl.determine_executor_actions() == []
+    md.now += 30.0
     replacements = ctrl.determine_executor_actions()
     assert len(replacements) == 2
     assert all(isinstance(a, CreateExecutorAction) for a in replacements)
