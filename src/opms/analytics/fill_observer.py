@@ -27,6 +27,7 @@ The observer is HB-aware only for event registration; the analytics objects
 
 import logging
 import time
+from collections import deque
 from typing import Optional
 
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
@@ -48,6 +49,8 @@ class FillObserver:
     execution quality metrics on one trading pair.
     """
 
+    MID_BUFFER_MAXLEN = 4096
+
     def __init__(
         self,
         venue: str,
@@ -66,6 +69,7 @@ class FillObserver:
         self._slippage_bps: list[float] = []
         self._last_mid: Optional[float] = None
         self._last_mid_ts: Optional[float] = None
+        self._mid_buffer: deque[tuple[float, float]] = deque(maxlen=self.MID_BUFFER_MAXLEN)
         self.last_fill_ts: Optional[float] = None
 
         # HB event forwarder — registered against the connector
@@ -113,7 +117,15 @@ class FillObserver:
             ts = time.time()
         self._last_mid = mid
         self._last_mid_ts = ts
+        self._mid_buffer.append((ts, mid))
         self._markout.on_mid(ts, mid)
+
+    def _mid_at(self, ts: float) -> Optional[float]:
+        """Most recent observed mid at or before the fill's event time."""
+        for mid_ts, mid in reversed(self._mid_buffer):
+            if mid_ts <= ts:
+                return mid
+        return self._last_mid  # fill older than the buffer; keep it, disclose staleness
 
     # ------------------------------------------------------------------
     # HB event callback
@@ -157,8 +169,8 @@ class FillObserver:
         size = float(event.amount)
         fee = self._fee_in_quote_token(event)
 
-        # Mid at fill — use the most recently observed mid.
-        mid_at_fill = self._last_mid
+        # Mid at fill — the mid in force at the event's own timestamp.
+        mid_at_fill = self._mid_at(ts)
 
         fill = Fill(
             ts=ts,
