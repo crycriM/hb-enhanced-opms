@@ -43,6 +43,13 @@ class BufferedMakerExecutor(OrderExecutor):
             return
         super().control_order()
 
+    def get_custom_info(self):
+        info = super().get_custom_info()
+        info["order_price"] = self._order.price if self._order else None
+        info["exchange_order_id"] = (self._order.order.exchange_order_id
+                                     if self._order and self._order.order else None)
+        return info
+
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         if self._order is None or event.order_id != self._order.order_id:
             return

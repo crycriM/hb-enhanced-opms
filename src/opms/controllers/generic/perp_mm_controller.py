@@ -11,7 +11,7 @@ import logging
 import math
 import os
 import time
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import List, Union
 
 from pydantic import Field
@@ -27,6 +27,7 @@ from mm_core.contracts import ExecIntent
 from mm_core.inventory import Caps
 from mm_core.regime import GateConfig
 from mm_core.risk_policy import Decision, RiskConfig
+from mm_core.quote_refresh import quote_refresh_reason
 
 from perp_bot.config import PerpPairConfig
 from perp_bot.keeper import Keeper
@@ -107,6 +108,13 @@ class PerpMMControllerConfig(ControllerConfigBase):
     account_id: str = "default"
     gamma: float = 0.5
     kappa: float = 0.3
+    pricing_model: str = "legacy"
+    arrival_rate_per_s: float | None = Field(default=None, gt=0)
+    sigma_bps_sqrt_s: float | None = Field(default=None, gt=0)
+    fixed_half_spread_bps: float = Field(default=10.0, gt=0)
+    maker_fee_bps: float = 1.5
+    min_edge_bps: float = Field(default=0.0, ge=0)
+    quote_reprice_bps: float = Field(default=2.0, gt=0)
     max_market_data_age_s: float | None = Field(default=None, gt=0)
     widen_factor: float = 2.0
     max_position: float = 10.0
@@ -186,6 +194,12 @@ class PerpMMController(ControllerBase):
             coin=config.coin,
             gamma=config.gamma,
             kappa=config.kappa,
+            pricing_model=config.pricing_model,
+            arrival_rate_per_s=config.arrival_rate_per_s,
+            sigma_bps_sqrt_s=config.sigma_bps_sqrt_s,
+            fixed_half_spread_bps=config.fixed_half_spread_bps,
+            maker_fee_bps=config.maker_fee_bps,
+            min_edge_bps=config.min_edge_bps,
             widen_factor=config.widen_factor,
             exchange=config.venue,
             account_id=config.account_id,
@@ -761,9 +775,13 @@ class PerpMMController(ControllerBase):
                         still_fresh = oldest_age < getattr(
                             self.config, "quote_refresh_interval", 20.0
                         )
-                        if exact_executor_set and (waiting_for_order_ids or still_fresh):
+                        reason = self._economic_refresh_reason(active_quotes, specs, now)
+                        if exact_executor_set and reason is None and (waiting_for_order_ids or still_fresh):
                             keep = {e.id for e in active}
                         else:
+                            self._last_quote_refresh_reason = reason or "sides_or_max_age"
+                            logger.info("%s quote refresh: %s", self.config.trading_pair,
+                                        self._last_quote_refresh_reason)
                             self._quote_refresh_pending = True
                             self._quote_cancel_started_at = now
                             self._quote_liveness.suspend()
@@ -836,6 +854,36 @@ class PerpMMController(ControllerBase):
         age = time.perf_counter() - max(timestamps)
         return age if math.isfinite(age) and age >= 0 else float("inf")
 
+    def _economic_refresh_reason(self, active_quotes, specs, now) -> str | None:
+        desired = {s.side: s for s in specs}
+        mid = float(self.get_current_price(self.config.connector_name,
+                                          self.config.trading_pair, PriceType.MidPrice))
+        for executor in active_quotes:
+            side = self._quote_side(executor.config.side)
+            spec = desired.get(side)
+            if spec is None:
+                return "side_removed"
+            info = getattr(executor, "custom_info", {}) or {}
+            remaining = float(executor.config.amount) - float(info.get("executed_amount_base", 0))
+            if remaining > float(spec.amount) + 1e-12:
+                return "size_risk"
+            # Buffered retries can differ from the configured price. Inspect
+            # the actual resting order; config is only a pre-ack fallback.
+            price = info.get("order_price") or executor.config.price
+            wanted = self._buffered_maker_price(spec)
+            if price is None or wanted is None:
+                return "invalid_price"
+            reason = quote_refresh_reason(
+                side=side, price=float(price), desired_price=float(wanted), mid=mid,
+                age_s=now - float(executor.config.timestamp),
+                max_age_s=self.config.quote_refresh_interval,
+                reprice_bps=self.config.quote_reprice_bps,
+                min_edge_bps=self.config.maker_fee_bps + self.config.min_edge_bps,
+            )
+            if reason:
+                return reason
+        return None
+
     @staticmethod
     def _is_quote_executor(executor) -> bool:
         config = executor.config
@@ -851,6 +899,8 @@ class PerpMMController(ControllerBase):
             info = getattr(executor, "custom_info", {}) or {}
             if not info.get("order_id"):
                 continue
+            if "exchange_order_id" in info and not info.get("exchange_order_id"):
+                continue  # a local client id is not a venue acknowledgement
             live.add(self._quote_side(executor.config.side))
         return live
 
@@ -871,6 +921,14 @@ class PerpMMController(ControllerBase):
             price = self._buffered_maker_price(spec)
             if price is None:
                 continue
+            rules = self.market_data_provider.get_trading_rules(
+                self.config.connector_name, self.config.trading_pair)
+            amount = Decimal(str(spec.amount))
+            step = rules.min_base_amount_increment
+            if step and step > 0:
+                amount = (amount / step).to_integral_value(rounding=ROUND_FLOOR) * step
+            if amount < (rules.min_order_size or 0) or amount * price < (rules.min_notional_size or 0):
+                continue  # check AFTER buffering and amount quantization
             actions.append(CreateExecutorAction(
                 controller_id=self.config.id,
                 executor_config=BufferedMakerExecutorConfig(
@@ -878,7 +936,7 @@ class PerpMMController(ControllerBase):
                     trading_pair=self.config.trading_pair,
                     connector_name=self.config.connector_name,
                     side=TradeType.BUY if spec.side == "buy" else TradeType.SELL,
-                    amount=Decimal(str(spec.amount)),
+                    amount=amount,
                     price=price,
                     execution_strategy=ExecutionStrategy.LIMIT_MAKER,
                     position_action=(
