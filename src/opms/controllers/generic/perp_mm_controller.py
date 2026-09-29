@@ -35,6 +35,7 @@ from perp_bot.margin_health import fail_closed_margin_available
 from perp_bot.opms_client import Position
 
 from opms.analytics.fill_observer import FillObserver
+from opms.connectors import hl_bbo
 from opms.executors.buffered_maker_executor import (
     BufferedMakerExecutor,
     BufferedMakerExecutorConfig,
@@ -52,6 +53,8 @@ from .perp_mm_bridge import (
 from .portfolio_stop import PortfolioStopBook
 
 logger = logging.getLogger(__name__)
+
+hl_bbo.apply()  # HL l2Book alone is ~5.5 s stale; see opms.connectors.hl_bbo
 
 # HB's ExecutorOrchestrator only knows its built-in executors. Register the
 # passive-aggressive executor so a CreateExecutorAction carrying our config
@@ -844,7 +847,7 @@ class PerpMMController(ControllerBase):
         tracker = getattr(connector, "order_book_tracker", None)
         metrics = getattr(tracker, "metrics", None)
         pair = getattr(metrics, "per_pair_metrics", {}).get(self.config.trading_pair)
-        if pair is None:
+        if pair is None or not hl_bbo.feed_healthy(connector, self.config.trading_pair):
             return float("inf")  # explicit freshness gate fails closed
         timestamps = []
         for value in (pair.last_diff_timestamp, pair.last_snapshot_timestamp):
