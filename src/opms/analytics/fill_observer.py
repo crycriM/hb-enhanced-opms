@@ -27,7 +27,6 @@ The observer is HB-aware only for event registration; the analytics objects
 
 import logging
 import time
-from decimal import Decimal
 from typing import Optional
 
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
@@ -120,6 +119,26 @@ class FillObserver:
     # HB event callback
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _fee_in_quote_token(event: OrderFilledEvent) -> float:
+        """Sum percent and all flat fees in quote terms; never lose a fill."""
+        try:
+            return float(event.trade_fee.fee_amount_in_token(
+                trading_pair=event.trading_pair, price=event.price,
+                order_amount=event.amount,
+                token=event.trading_pair.split("-")[1],
+            ))
+        except Exception as exc:
+            # A missing rate oracle must not silently erase real fill economics.
+            logger.warning(
+                "FillObserver: fee conversion failed for %s order %s (%s); "
+                "recording fill with fee=0",
+                event.trading_pair,
+                event.order_id,
+                exc,
+            )
+            return 0.0
+
     def _on_fill_event(
         self,
         event_tag: int,
@@ -136,10 +155,7 @@ class FillObserver:
         side = "buy" if event.trade_type == TradeType.BUY else "sell"
         price = float(event.price)
         size = float(event.amount)
-        fee = float(event.trade_fee.fee_amount_in_token(
-            trading_pair=event.trading_pair, price=event.price,
-            order_amount=event.amount, token=event.trading_pair.split("-")[1],
-        ))
+        fee = self._fee_in_quote_token(event)
 
         # Mid at fill — use the most recently observed mid.
         mid_at_fill = self._last_mid
