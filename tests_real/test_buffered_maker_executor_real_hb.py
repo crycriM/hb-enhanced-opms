@@ -75,3 +75,23 @@ def test_rejected_quote_backs_off_then_reprices_from_fresh_touch():
 
     assert strategy.buy.call_count == 2
     assert strategy.buy.call_args.args[4] == Decimal("98.9208")
+
+
+def test_custom_info_distinguishes_local_submission_from_venue_ack():
+    strategy, _ = _strategy()
+    executor = BufferedMakerExecutor(strategy, _config())
+    executor.control_order()
+
+    before_ack = executor.get_custom_info()
+    assert before_ack["order_id"] == "oid-1"
+    assert before_ack["exchange_order_id"] is None
+
+    executor._order.order = MagicMock(
+        price=Decimal("99.9200"),
+        exchange_order_id="exchange-1",
+        executed_amount_base=Decimal("0"),
+        last_update_timestamp=100.0,
+    )
+    after_ack = executor.get_custom_info()
+    assert after_ack["order_price"] == Decimal("99.9200")
+    assert after_ack["exchange_order_id"] == "exchange-1"
