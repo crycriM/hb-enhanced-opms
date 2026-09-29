@@ -390,6 +390,26 @@ def _with_active(ctrl, executors):
     return ctrl
 
 
+class _MarketDataWithBookMetrics(_MarketData):
+    def __init__(self, last_diff=0.0, last_snapshot=0.0):
+        from types import SimpleNamespace
+
+        super().__init__()
+        pair = SimpleNamespace(
+            last_diff_timestamp=last_diff,
+            last_snapshot_timestamp=last_snapshot,
+        )
+        metrics = SimpleNamespace(per_pair_metrics={"ETH-USD": pair})
+        self.pair_metrics = pair
+        self.connector = SimpleNamespace(
+            account_positions={},
+            order_book_tracker=SimpleNamespace(metrics=metrics),
+        )
+
+    def get_connector(self, connector_name):
+        return self.connector
+
+
 def test_in_flight_de_risk_executor_is_kept_across_cycles():
     """Stop/recreate every control cycle would reset the PA child clock, so the
     aggressive fallback (and an emergency exit) could never fire."""
@@ -476,6 +496,75 @@ def test_quote_refresh_cancels_before_creating_replacements():
     replacements = ctrl.determine_executor_actions()
     assert len(replacements) == 2
     assert all(isinstance(a, CreateExecutorAction) for a in replacements)
+
+
+def test_market_data_age_uses_hb_monotonic_metrics_and_fails_closed(monkeypatch):
+    import math
+    import opms.controllers.generic.perp_mm_controller as controller_module
+
+    md = _MarketDataWithBookMetrics(last_diff=97.5)
+    ctrl = _controller(md)
+    monkeypatch.setattr(controller_module.time, "perf_counter", lambda: 100.0)
+
+    assert ctrl._market_data_age_s() == pytest.approx(2.5)
+
+    md.connector.order_book_tracker.metrics.per_pair_metrics.clear()
+    assert math.isinf(ctrl._market_data_age_s())
+
+    md.connector.order_book_tracker.metrics.per_pair_metrics["ETH-USD"] = md.pair_metrics
+    md.pair_metrics.last_diff_timestamp = float("nan")
+    md.pair_metrics.last_snapshot_timestamp = float("nan")
+    assert math.isinf(ctrl._market_data_age_s())
+
+
+def test_stale_book_cancels_quotes_allows_flatten_and_recovers(monkeypatch):
+    import opms.controllers.generic.perp_mm_controller as controller_module
+    from hummingbot.strategy_v2.models.executor_actions import (
+        CreateExecutorAction,
+        StopExecutorAction,
+    )
+
+    md = _MarketDataWithBookMetrics(last_diff=100.0)
+    ctrl = _controller(md)
+    ctrl.config = _config(max_market_data_age_s=2.0)
+    monkeypatch.setattr(controller_module.time, "perf_counter", lambda: 100.0)
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", account_id="e2_mm1",
+        target_inventory=0.0, current_inventory=0.0,
+        quote=QuoteSpec(bid_price=2999.0, ask_price=3001.0,
+                        bid_size=0.01, ask_size=0.01),
+        urgency="passive",
+    )
+    created = ctrl.determine_executor_actions()
+    quotes = [
+        _ExecInfo(f"q-{i}", action.executor_config, {"order_id": f"oid-{i}"})
+        for i, action in enumerate(created)
+    ]
+    _with_active(ctrl, quotes)
+
+    md.pair_metrics.last_diff_timestamp = 97.0
+    stale_actions = ctrl.determine_executor_actions()
+    assert len(stale_actions) == 2
+    assert all(isinstance(action, StopExecutorAction) for action in stale_actions)
+
+    _with_active(ctrl, [])
+    ctrl._client.last_intent = _de_risk_intent("emergency")
+    flatten = ctrl.determine_executor_actions()
+    assert len(flatten) == 1
+    assert isinstance(flatten[0], CreateExecutorAction)
+
+    _with_active(ctrl, [])
+    md.pair_metrics.last_diff_timestamp = 100.0
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", account_id="e2_mm1",
+        target_inventory=0.0, current_inventory=0.0,
+        quote=QuoteSpec(bid_price=2999.0, ask_price=3001.0,
+                        bid_size=0.01, ask_size=0.01),
+        urgency="passive",
+    )
+    recovered = ctrl.determine_executor_actions()
+    assert len(recovered) == 2
+    assert all(isinstance(action, CreateExecutorAction) for action in recovered)
 
 
 def test_stale_quote_liveness_trips_to_reduce_only_flatten():
@@ -723,6 +812,25 @@ async def test_update_processed_data_feeds_margin_available_to_keeper():
     )
     await asyncio.wait_for(ctrl.update_processed_data(), 10)
     assert ctrl.keeper._margin_available == pytest.approx(271.4)
+
+
+async def test_update_processed_data_reads_mid_after_slow_margin_call():
+    import asyncio
+
+    class _MovingMidConnector(_ConnectorWithSpotState):
+        async def _api_post(self, path_url, data=None):
+            market_data._mid = Decimal("3100")
+            await asyncio.sleep(0)
+            return await super()._api_post(path_url, data)
+
+    connector = _MovingMidConnector(_spot_state())
+    market_data = _MarketDataWithSpot(connector, mid="3000")
+    ctrl = PerpMMController(_config(), market_data, asyncio.Queue())
+
+    await ctrl.update_processed_data()
+
+    assert ctrl._fill_observer._last_mid == pytest.approx(3100.0)
+    assert ctrl.keeper._mid_history[-1][1] == pytest.approx(3100.0)
 
 
 async def test_control_task_cancels_quotes_when_connector_is_not_ready():
