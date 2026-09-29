@@ -8,6 +8,7 @@ mm_core + Keeper — nothing is re-implemented here.
 
 import asyncio
 import logging
+import math
 import os
 import time
 from decimal import ROUND_CEILING, Decimal
@@ -106,6 +107,7 @@ class PerpMMControllerConfig(ControllerConfigBase):
     account_id: str = "default"
     gamma: float = 0.5
     kappa: float = 0.3
+    max_market_data_age_s: float | None = Field(default=None, gt=0)
     widen_factor: float = 2.0
     max_position: float = 10.0
     critical_position: float = 20.0
@@ -379,6 +381,9 @@ class PerpMMController(ControllerBase):
 
     async def update_processed_data(self):
         await self._refresh_positions_after_fills()
+        # Read the fair price AFTER the potentially slow REST margin call.
+        # Previously a seconds-old mid was stamped with the current time.
+        margin_available = await self._current_margin_available()
         mid = self.get_current_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
         funding_info = self.market_data_provider.get_funding_info(self.config.connector_name, self.config.trading_pair)
         funding_rate = float(funding_info.rate) if funding_info is not None else None
@@ -391,7 +396,7 @@ class PerpMMController(ControllerBase):
                 coin=self.config.coin,
                 position=current_position,
                 equity=float(self._current_equity()),
-                margin_available=await self._current_margin_available(),
+                margin_available=margin_available,
             )
         })
 
@@ -664,6 +669,15 @@ class PerpMMController(ControllerBase):
         )
         keep: set[str] = set()
 
+        max_data_age = getattr(self.config, "max_market_data_age_s", None)
+        if (max_data_age is not None and intent_is_quoting(self._client.last_intent)
+                and self._market_data_age_s() > max_data_age):
+            self._last_quote_refresh_reason = "stale_market_data"
+            self._quote_liveness.suspend()
+            # Do not block a risk-reducing executor on a stale public book.
+            return [StopExecutorAction(controller_id=self.config.id, executor_id=e.id)
+                    for e in active if self._is_quote_executor(e)]
+
         if intent_is_quoting(self._client.last_intent):
             specs = self._executable_quote_specs(
                 intent_to_order_specs(self._client.last_intent)
@@ -792,6 +806,26 @@ class PerpMMController(ControllerBase):
             for e in active if e.id not in keep
         ]
         return stops + new_actions
+
+    def _market_data_age_s(self) -> float:
+        connector = self.market_data_provider.get_connector(self.config.connector_name)
+        tracker = getattr(connector, "order_book_tracker", None)
+        metrics = getattr(tracker, "metrics", None)
+        pair = getattr(metrics, "per_pair_metrics", {}).get(self.config.trading_pair)
+        if pair is None:
+            return float("inf")  # explicit freshness gate fails closed
+        timestamps = []
+        for value in (pair.last_diff_timestamp, pair.last_snapshot_timestamp):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if value > 0 and math.isfinite(value):
+                timestamps.append(value)
+        if not timestamps:
+            return float("inf")
+        age = time.perf_counter() - max(timestamps)
+        return age if math.isfinite(age) and age >= 0 else float("inf")
 
     @staticmethod
     def _is_quote_executor(executor) -> bool:
