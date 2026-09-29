@@ -194,3 +194,44 @@ class TestFillObserverSlippage:
         stats = observer.slippage_stats()
         assert stats["n"] == 0
         assert stats["mean_bps"] is None
+
+
+class TestFillObserverEventTimeMidAlignment:
+    def test_delayed_fill_uses_mid_as_of_event_time(self):
+        observer = FillObserver(venue="hl", symbol="SOL-PERP")
+        observer.update_mid(100.0, ts=1.0)
+        observer.update_mid(110.0, ts=5.0)
+        event = _make_fill_event("ordA", "SOL-PERP", "buy", 101.0, 1.0)
+        event.timestamp = 3.0
+        observer._on_fill_event(0, None, event)
+        fill = observer._ledger.fills[0]
+        assert fill.mid_at_fill == 100.0
+        assert observer._slippage_bps[-1] == pytest.approx(100.0)
+
+    def test_fill_after_all_mids_uses_latest_mid(self):
+        observer = FillObserver(venue="hl", symbol="SOL-PERP")
+        observer.update_mid(100.0, ts=1.0)
+        observer.update_mid(101.0, ts=2.0)
+        event = _make_fill_event("ordB", "SOL-PERP", "buy", 101.5, 1.0)
+        event.timestamp = 2.5
+        observer._on_fill_event(0, None, event)
+        assert observer._ledger.fills[0].mid_at_fill == 101.0
+
+    def test_event_older_than_buffer_falls_back_without_losing_fill(self):
+        observer = FillObserver(venue="hl", symbol="SOL-PERP")
+        observer.update_mid(120.0, ts=10.0)
+        event = _make_fill_event("ordC", "SOL-PERP", "buy", 120.0, 1.0)
+        event.timestamp = 5.0
+        observer._on_fill_event(0, None, event)
+        assert observer._ledger.fills[0].mid_at_fill == 120.0
+
+    def test_mid_buffer_is_bounded(self):
+        observer = FillObserver(venue="hl", symbol="SOL-PERP")
+        limit = FillObserver.MID_BUFFER_MAXLEN
+        for i in range(limit + 5):
+            observer.update_mid(100.0 + i, ts=float(i))
+        assert len(observer._mid_buffer) == limit
+        event = _make_fill_event("ordD", "SOL-PERP", "buy", 100.0, 1.0)
+        event.timestamp = 1.0
+        observer._on_fill_event(0, None, event)
+        assert observer._ledger.fills[0].mid_at_fill == 100.0 + limit + 4
