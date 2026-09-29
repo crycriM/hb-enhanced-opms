@@ -31,6 +31,7 @@ def main() -> int:
     parser.add_argument("--script-config")
     parser.add_argument("--coins", nargs="+", default=["ETH", "SOL"])
     parser.add_argument("--leverage", type=int, default=6)
+    parser.add_argument("--update-interval", type=float, default=5.0)
     parser.add_argument("--flat-targets", action="store_true")
     parser.add_argument("--expected-target", action="append", default=[])
     parser.add_argument(
@@ -101,8 +102,8 @@ def main() -> int:
             raise ValueError("soak must have the regime gate disabled for every controller")
         if any(c.toxic_markout_bps is not None for c in controllers):
             raise ValueError("soak must have toxic-markout widening disabled")
-    if any(c.shadow_mode or c.update_interval != 5.0 for c in controllers):
-        raise ValueError("soak controllers must be live at a 5s cadence")
+    if any(c.shadow_mode or c.update_interval != args.update_interval for c in controllers):
+        raise ValueError("soak controllers must be live at the calibrated cadence")
     for controller in controllers:
         _check_account_routing(controller, _Connector(address), env)
     print(f"{script_name}: {account}, {len(controllers)} live controller(s), "

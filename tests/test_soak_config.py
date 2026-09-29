@@ -39,15 +39,15 @@ def test_dual_ena_override_profile_has_equal_opposite_targets():
         for account in ("e2_mm1", "e3_sub1")
     }
 
-    assert configs["e2_mm1"]["target_inventory"] == 39.0
-    assert configs["e3_sub1"]["target_inventory"] == -39.0
+    assert configs["e2_mm1"]["target_inventory"] == 50.0
+    assert configs["e3_sub1"]["target_inventory"] == -50.0
     for account, cfg in configs.items():
         assert cfg["trading_pair"] == "ENA-USD"
         assert cfg["account_id"] == account
-        assert cfg["quote_size"] == 39.0
+        assert cfg["quote_size"] == 50.0
         assert cfg["price_tick"] == 0.00001
-        assert cfg["max_position"] == 195.0
-        assert cfg["critical_position"] == 390.0
+        assert cfg["max_position"] == 250.0
+        assert cfg["critical_position"] == 500.0
         assert cfg["gamma"] == 5.0
         assert cfg["kappa"] == 20_000.0
         assert cfg["leverage"] == 3

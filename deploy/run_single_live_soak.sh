@@ -18,6 +18,8 @@ read -r -a COINS <<< "${SOAK_COINS:-ETH SOL}"
 SCRIPT_CONFIG="${SOAK_SCRIPT_CONFIG:-opms_perp_mm_${ACCOUNT_ID}_soak.yml}"
 SOAK_LEVERAGE="${SOAK_LEVERAGE:-6}"
 SOAK_RISK_GATES="${SOAK_RISK_GATES:-disabled}"
+CONFIG_DIR="${SOAK_CONFIG_DIR:-$REPO/hb-enhanced-opms/deploy/hummingbot/conf}"
+SOAK_UPDATE_INTERVAL="${SOAK_UPDATE_INTERVAL:-5}"
 MIN_COLLATERAL="${MIN_COLLATERAL:-600}"
 MAX_DRAWDOWN_PCT="${MAX_DRAWDOWN_PCT:-1.0}"
 STAMP="$(date +%Y%m%dT%H%M%S)"
@@ -35,6 +37,10 @@ COMMON_PYTHONPATH="$REPO/hb-enhanced-opms/src:$REPO/perp-bot/src:$REPO/mm-core/s
   echo "refusing live orders: set OPMS_HB_PLACE_ORDERS=confirm" >&2; exit 2;
 }
 [[ -x "$PY" ]] || { echo "Hummingbot Python not found: $PY" >&2; exit 2; }
+if [[ -n "${SOAK_CONFIG_DIR:-}" ]]; then
+  PYTHONPATH="$COMMON_PYTHONPATH" "$PY" "$REPO/hb-enhanced-opms/scripts/validate_calibrated_soak.py" \
+    "$CONFIG_DIR" --account "$ACCOUNT_ID" --coins "${COINS[@]}"
+fi
 [[ -d "$HB_SOURCE/hummingbot" && -x "$HB_SOURCE/bin/hummingbot_quickstart.py" ]] || {
   echo "Hummingbot checkout not found at $HB_SOURCE" >&2; exit 2;
 }
@@ -78,10 +84,10 @@ cp -al "$HB_SOURCE/scripts" "$RUNTIME/scripts"
 cp -al "$HB_SOURCE/controllers" "$RUNTIME/controllers"
 cp -a "$HB_SOURCE/conf" "$RUNTIME/conf"
 mkdir -p "$RUNTIME/data" "$RUNTIME/logs"
-cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/scripts/$SCRIPT_CONFIG" \
+cp --remove-destination "$CONFIG_DIR/scripts/$SCRIPT_CONFIG" \
    "$RUNTIME/conf/scripts/"
 for coin in "${COINS[@]}"; do
-  cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/conf/controllers/perp_mm_${ACCOUNT_ID}_${coin,,}_soak.yml" \
+  cp --remove-destination "$CONFIG_DIR/controllers/perp_mm_${ACCOUNT_ID}_${coin,,}_soak.yml" \
      "$RUNTIME/conf/controllers/"
 done
 cp --remove-destination "$REPO/hb-enhanced-opms/deploy/hummingbot/scripts/validate_hb_soak_config.py" \
@@ -102,7 +108,8 @@ fi
 (
   cd "$RUNTIME"
   VALIDATE_ARGS=(--account-id "$ACCOUNT_ID" --script-config "$SCRIPT_CONFIG"
-    --coins "${COINS[@]}" --leverage "$SOAK_LEVERAGE" --risk-gates "$SOAK_RISK_GATES")
+    --coins "${COINS[@]}" --leverage "$SOAK_LEVERAGE" --risk-gates "$SOAK_RISK_GATES"
+    --update-interval "$SOAK_UPDATE_INTERVAL")
   [[ "${SOAK_FLAT_TARGETS:-}" == 1 ]] && VALIDATE_ARGS+=(--flat-targets)
   OPMS_ENV_FILE="$ENV_FILE" PYTHONPATH="$RUNTIME:$COMMON_PYTHONPATH" \
     "$PY" "$RUNTIME/scripts/validate_hb_soak_config.py" "${VALIDATE_ARGS[@]}"

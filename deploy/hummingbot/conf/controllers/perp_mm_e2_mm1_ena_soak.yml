@@ -9,10 +9,10 @@ account_id: e2_mm1
 gamma: 5.0
 kappa: 20000.0
 widen_factor: 2.0
-max_position: 195.0
-critical_position: 390.0
-target_inventory: 39.0
-quote_size: 39.0
+max_position: 250.0
+critical_position: 500.0
+target_inventory: 50.0
+quote_size: 50.0
 price_tick: 0.00001
 leverage: 3
 regime_stop: false

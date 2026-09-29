@@ -403,6 +403,11 @@ class PerpMMController(ControllerBase):
         funding_rate = float(funding_info.rate) if funding_info is not None else None
 
         self._fill_observer.update_mid(float(mid))
+        rules = self.market_data_provider.get_trading_rules(
+            self.config.connector_name, self.config.trading_pair
+        )
+        self.keeper.config.min_quote_notional = float(rules.min_notional_size or 0)
+        self.keeper.config.size_step = float(rules.min_base_amount_increment or 0) or None
 
         current_position = self._position_for_decision()
         self._client.set_positions({
