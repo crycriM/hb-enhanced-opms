@@ -364,3 +364,18 @@ class TestOutcomeTrueCloseType:
         calls_before = strategy.buy.call_count
         exe.process_order_failed_event(0, None, _failed_event(aggressive_id))
         assert strategy.buy.call_count == calls_before  # no post-stop re-placement
+
+
+def test_no_limit_placed_at_nan_or_zero_price():
+    for bad in (Decimal("NaN"), Decimal("0")):
+        executor, strategy = _make_executor()
+        strategy.connectors["hyperliquid_perpetual"].get_price_by_type.return_value = bad
+        executor._step()
+        child = executor._children[0]
+        assert strategy.buy.call_count == 0 and child.status == _ChildStatus.IDLE
+        assert child.retry_at is not None
+
+
+def test_absurd_child_count_is_rejected():
+    with pytest.raises(ValueError, match="MAX_CHILDREN"):
+        _make_executor(total=Decimal("1000"), child_q=Decimal("0.001"))

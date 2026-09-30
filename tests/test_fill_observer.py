@@ -235,3 +235,10 @@ class TestFillObserverEventTimeMidAlignment:
         event.timestamp = 1.0
         observer._on_fill_event(0, None, event)
         assert observer._ledger.fills[0].mid_at_fill == 100.0 + limit + 4
+
+
+def test_malformed_fill_is_dropped_not_raised():
+    observer = FillObserver(venue="hl", symbol="SOL-PERP")
+    observer._on_fill_event(0, MagicMock(), _make_fill_event("oid-1", "SOL-PERP", "buy", 0.0, 1.0))
+    observer._on_fill_event(0, MagicMock(), _make_fill_event("oid-2", "SOL-PERP", "buy", 100.0, 1.0))
+    assert observer.position == 1.0 and len(observer._ledger.fills) == 1

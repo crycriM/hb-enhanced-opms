@@ -80,6 +80,10 @@ def build_schedule(
         fractions = [j / num_intervals for j in range(num_intervals + 1)]
     else:
         fractions = cumulative_volume_fractions
+        # A decreasing fraction would produce a negative slice, i.e. an order on the other side.
+        if (any(not (0.0 <= a <= b) for a, b in zip(fractions, fractions[1:]))
+                or fractions[-1] > 1.0 + 1e-9):
+            raise ValueError("cumulative_volume_fractions must be non-decreasing, within [0, 1]")
 
     # Holdings: x_j = Q * sinh_ratio(1 - V_j, a)
     holdings = [_sinh_ratio(1.0 - v, a) for v in fractions]

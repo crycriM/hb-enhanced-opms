@@ -68,7 +68,6 @@ class FillObserver:
         # Slippage tracking: fill_price vs mid_at_fill (bps, signed)
         self._slippage_bps: list[float] = []
         self._last_mid: Optional[float] = None
-        self._last_mid_ts: Optional[float] = None
         self._mid_buffer: deque[tuple[float, float]] = deque(maxlen=self.MID_BUFFER_MAXLEN)
         self.last_fill_ts: Optional[float] = None
 
@@ -116,7 +115,6 @@ class FillObserver:
         if ts is None:
             ts = time.time()
         self._last_mid = mid
-        self._last_mid_ts = ts
         self._mid_buffer.append((ts, mid))
         self._markout.on_mid(ts, mid)
 
@@ -181,7 +179,13 @@ class FillObserver:
             mid_at_fill=mid_at_fill,
             label=f"order_{event.order_id[:8]}" if event.order_id else "",
         )
-        self._ledger.on_fill(fill)
+        try:
+            self._ledger.on_fill(fill)
+        except ValueError:
+            # The venue position is re-read every cycle, so dropping is safe; raising would
+            # propagate into Hummingbot's event dispatcher.
+            logger.error("FillObserver: dropping malformed fill %r", fill)
+            return
         self._markout.on_fill(ts, side, price, size)
 
         # Slippage: (fill_price - mid_at_fill) × direction / mid, in bps.

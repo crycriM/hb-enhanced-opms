@@ -80,6 +80,9 @@ class InProcessClient:
     async def send_intent(self, intent: ExecIntent | PortfolioExecIntent) -> dict:
         if isinstance(intent, PortfolioExecIntent):
             return await self.send_portfolio_intent(intent)
+        # Same last-line check as perp_bot.OpmsClient: last_intent feeds order price/size math.
+        if errors := intent.validation_errors():
+            raise ValueError(f"refusing invalid intent: {errors}")
         current = self.last_intent
         position = self._positions.get(current.coin) if current is not None else None
         if (

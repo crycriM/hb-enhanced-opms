@@ -20,6 +20,7 @@ Key differences from PA-V2:
 """
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -79,6 +80,7 @@ class _ChildStatus(Enum):
 
 
 _TERMINAL_STATUSES = (_ChildStatus.DONE, _ChildStatus.SKIPPED)
+MAX_CHILDREN = 200  # a mis-sized child quantity must not become thousands of orders
 
 
 @dataclass
@@ -138,6 +140,8 @@ class PassiveAggressiveExecutor(ExecutorBase):
         if child_q <= 0:
             raise ValueError("child_order_quantity must be positive")
         n = int(q // child_q)
+        if n > MAX_CHILDREN:
+            raise ValueError(f"{n} children exceeds MAX_CHILDREN={MAX_CHILDREN}; check child_order_quantity")
         remainder = q - n * child_q
         slots = [_ChildSlot(target=child_q) for _ in range(n)]
         if remainder > 0:
@@ -253,6 +257,11 @@ class PassiveAggressiveExecutor(ExecutorBase):
     def _place_limit(self, child: _ChildSlot):
         price_type = PriceType.BestBid if self.config.side == TradeType.BUY else PriceType.BestAsk
         price = self.get_price(self.config.connector_name, self.config.trading_pair, price_type)
+        if not (math.isfinite(price) and price > 0):
+            # HB reports "no book" as NaN; never send that (or 0) to the venue as a limit price.
+            child.retry_at = self._strategy.current_timestamp + 1.0
+            logger.error(f"PA child {self._child_idx}: no valid {price_type} ({price}); not placing")
+            return
         remaining = child.target - child.filled
         order_id = self.place_order(
             connector_name=self.config.connector_name,
@@ -359,8 +368,6 @@ class PassiveAggressiveExecutor(ExecutorBase):
         if not self._is_our_order(event.order_id):
             return
         child = self._active_child()
-        incremental = event.trade_type == TradeType.BUY and event.amount or event.amount
-        # Always use event.amount as the filled increment for this event.
         incremental = event.amount
         child.filled += incremental
         self._cumulative_filled += incremental

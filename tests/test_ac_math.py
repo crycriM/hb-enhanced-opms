@@ -123,3 +123,16 @@ class TestBuildSchedule:
         # Volume-aware: more traded early (steeper front-loading)
         assert sizes_vol[0] >= sizes_clock[0]
         assert sum(sizes_vol) == Decimal("10")
+
+
+def test_non_monotonic_volume_fractions_are_rejected():
+    import pytest
+    from decimal import Decimal
+    from opms.executors._ac_math import build_schedule
+
+    kwargs = dict(total_quantity=Decimal("10"), duration_seconds=100.0, num_intervals=4,
+                  risk_aversion=1e-6, volatility=0.02, eta=0.01)
+    with pytest.raises(ValueError, match="non-decreasing"):
+        build_schedule(**kwargs, cumulative_volume_fractions=[0.0, 0.5, 0.3, 0.8, 1.0])
+    sizes = build_schedule(**kwargs, cumulative_volume_fractions=[0.0, 0.1, 0.3, 0.6, 1.0])
+    assert sum(sizes) == Decimal("10") and all(s >= 0 for s in sizes)

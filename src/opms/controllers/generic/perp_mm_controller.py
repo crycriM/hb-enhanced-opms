@@ -582,6 +582,13 @@ class PerpMMController(ControllerBase):
                 return Decimal(str(balances[asset]))
         if len(balances) == 1:
             return Decimal(str(next(iter(balances.values()))))
+        # Equity 0 switches off the margin-health and drawdown stops (RiskPolicy guards the
+        # division), so an unresolvable collateral label must never pass quietly.
+        logger.error(
+            "%s: no collateral balance found (asset=%r, balances=%s); equity reads 0 and the "
+            "margin/drawdown stops are blind", self.config.trading_pair,
+            self.config.collateral_asset, sorted(balances),
+        )
         return Decimal("0")
 
     def _min_child_quantity(self) -> Decimal:
@@ -730,9 +737,8 @@ class PerpMMController(ControllerBase):
                     # lack of venue ids is planned, not a liveness incident.
                     self._quote_liveness.suspend()
                     started = getattr(self, "_quote_cancel_started_at", None)
-                    if active and self._cancel_timed_out(now, expected, live):
-                        new_actions = []
-                    elif active:
+                    if active:
+                        self._cancel_timed_out(now, expected, live)
                         new_actions = []
                     else:
                         self._quote_refresh_pending = False

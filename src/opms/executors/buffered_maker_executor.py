@@ -24,6 +24,8 @@ class BufferedMakerExecutor(OrderExecutor):
 
     def get_order_price(self) -> Decimal:
         touch = self.current_market_price
+        if not touch.is_finite() or touch <= 0:  # NaN = no book; never price a maker order off it
+            raise ValueError(f"no valid touch price ({touch}); refusing to price a maker order")
         edge = self.config.maker_buffer_bps / Decimal("10000")
         buffered = touch * (
             Decimal("1") - edge
