@@ -115,8 +115,8 @@ def test_intent_to_order_specs_quote():
                          quote=QuoteSpec(bid_price=99.0, ask_price=101.0, bid_size=1.0, ask_size=1.0))
     specs = intent_to_order_specs(intent)
     assert specs == [
-        OrderSpec(cancel_all=True, side="buy", price=99.0, amount=1.0, urgency="normal"),
-        OrderSpec(cancel_all=False, side="sell", price=101.0, amount=1.0, urgency="normal"),
+        OrderSpec(side="buy", price=99.0, amount=1.0, urgency="normal"),
+        OrderSpec(side="sell", price=101.0, amount=1.0, urgency="normal"),
     ]
 
 
@@ -215,7 +215,7 @@ def test_zero_sized_quote_side_is_not_routed():
     )
 
     assert intent_to_order_specs(intent) == [
-        OrderSpec(cancel_all=True, side="buy", price=99.0, amount=0.1, urgency="normal"),
+        OrderSpec(side="buy", price=99.0, amount=0.1, urgency="normal"),
     ]
 
 
@@ -228,7 +228,7 @@ def test_intent_to_order_specs_de_risk():
                          current_inventory=5.0, quote=None, urgency="normal",
                          strategy_hint="passive_aggressive")
     specs = intent_to_order_specs(intent)
-    assert specs == [OrderSpec(cancel_all=True)]
+    assert specs == []
 
 
 def test_intent_to_order_specs_none():
