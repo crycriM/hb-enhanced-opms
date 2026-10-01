@@ -12,6 +12,7 @@ accepts any CandlesProvider — tested without a real HB runtime.
 
 import asyncio
 import logging
+import math
 import time
 from decimal import Decimal
 from typing import Literal, Optional, Union
@@ -31,9 +32,36 @@ from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
+from pydantic import model_validator
+
 from opms.executors._ac_math import build_schedule
 
 logger = logging.getLogger(__name__)
+
+# Conservative limits for this remediation (2026-10-01); record a concrete
+# operational need before raising them.
+MAX_AC_INTERVALS = 200
+MIN_AC_INTERVAL_S = 1.0
+
+
+def validate_ac_config(config) -> None:
+    """Reject, never clamp: AC is OPEN-only (no reduce-only proof per slice)
+    and its schedule is bounded before anything is allocated."""
+    if config.position_action != PositionAction.OPEN:
+        raise ValueError(
+            f"AC executes OPEN only (got {config.position_action}); route closes and "
+            f"de-risk to the reduce-only passive-aggressive executor"
+        )
+    if not 1 <= config.num_intervals <= MAX_AC_INTERVALS:
+        raise ValueError(f"num_intervals must be within 1..{MAX_AC_INTERVALS} (got {config.num_intervals})")
+    duration = config.duration_seconds
+    if not (math.isfinite(duration) and duration > 0):
+        raise ValueError(f"duration_seconds must be finite and positive (got {duration})")
+    if duration / config.num_intervals < MIN_AC_INTERVAL_S:
+        raise ValueError(
+            f"duration_seconds {duration} over {config.num_intervals} intervals is under "
+            f"{MIN_AC_INTERVAL_S} s per slice"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +86,13 @@ class ACScheduleExecutorConfig(ExecutorConfigBase):
     volume_forecast: bool = False
     # For perp connectors
     leverage: int = 1
+    # Validated OPEN-only; a reduce-only AC needs its own per-slice proof.
+    position_action: PositionAction = PositionAction.OPEN
+
+    @model_validator(mode="after")
+    def _validate(self):
+        validate_ac_config(self)
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +123,7 @@ class ACScheduleExecutor(ExecutorBase):
             max_retries=max_retries,
         )
         self.config: ACScheduleExecutorConfig = config
+        validate_ac_config(config)  # also covers model_construct(), which skips validators
 
         # Build clock-time schedule immediately; may be replaced by volume-aware
         # schedule on first control_task if volume_forecast is enabled.
@@ -257,7 +293,7 @@ class ACScheduleExecutor(ExecutorBase):
             order_type=OrderType.MARKET,
             side=self.config.side,
             amount=amount,
-            position_action=PositionAction.OPEN,
+            position_action=self.config.position_action,
         )
         tracked = TrackedOrder(order_id=order_id)
         self._submitted.append(tracked)
