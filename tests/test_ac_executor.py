@@ -190,3 +190,66 @@ class TestShutdownAndOutcome:
         exe.evaluate_max_retries()
         assert exe._status == RunnableStatus.TERMINATED
         assert exe.close_type == CloseType.FAILED
+
+
+# ---------------------------------------------------------------------------
+# T3 (2026-10-01): OPEN-only and bounded schedules, rejected before allocation
+# ---------------------------------------------------------------------------
+
+from conftest import PositionAction  # noqa: E402
+
+
+class TestOpenOnlyAndScheduleLimits:
+    @pytest.mark.parametrize("action", [PositionAction.CLOSE, PositionAction.NIL])
+    def test_construction_rejects_non_open(self, action):
+        with pytest.raises(ValueError, match="OPEN"):
+            _make_executor(position_action=action)
+
+    async def test_default_open_reaches_order_submission(self):
+        exe, strategy = _make_executor()
+        assert exe.config.position_action == PositionAction.OPEN
+        await exe._tick()
+        assert strategy.buy.call_args.args[-1] == PositionAction.OPEN
+
+    @pytest.mark.parametrize("num_intervals, duration", [(0, 100.0), (201, 1000.0), (-1, 100.0)])
+    def test_interval_count_outside_1_to_200_rejects_before_allocation(
+            self, monkeypatch, num_intervals, duration):
+        import opms.executors.ac_schedule_executor as module
+
+        def _no_allocation(**_):
+            raise AssertionError("schedule allocated before validation")
+
+        monkeypatch.setattr(module, "build_schedule", _no_allocation)
+        with pytest.raises(ValueError, match="num_intervals"):
+            _make_executor(num_intervals=num_intervals, duration_seconds=duration)
+
+    @pytest.mark.parametrize("num_intervals, duration", [(1, 1.0), (200, 200.0)])
+    def test_interval_count_bounds_are_valid(self, num_intervals, duration):
+        exe, _ = _make_executor(num_intervals=num_intervals, duration_seconds=duration)
+        assert len(exe._schedule) == num_intervals
+        assert exe._interval_seconds >= 1.0
+
+    @pytest.mark.parametrize("duration", [0.0, -5.0, float("nan"), float("inf"), 199.0])
+    def test_invalid_or_subsecond_durations_reject(self, duration):
+        with pytest.raises(ValueError, match="duration"):
+            _make_executor(num_intervals=200, duration_seconds=duration)
+
+    async def test_volume_aware_schedule_keeps_the_limits(self, monkeypatch):
+        import opms.forecasting.historical_profile as profile
+
+        class _Forecaster:
+            def __init__(self, provider):
+                pass
+
+            async def forecast(self, symbol, num_buckets, bucket_seconds, start_time):
+                return [Decimal(i + 1) for i in range(num_buckets)]
+
+        monkeypatch.setattr(profile, "HistoricalProfileForecaster", _Forecaster)
+        monkeypatch.setattr(profile, "HBCandlesProvider", lambda **_: None)
+        exe, _ = _make_executor(num_intervals=200, duration_seconds=200.0, volume_forecast=True)
+        clock = list(exe._schedule)
+        await exe._tick()
+        assert exe._schedule != clock  # the volume path actually ran
+        assert len(exe._schedule) <= 200
+        assert exe._interval_seconds >= 1.0
+        assert sum(exe._schedule) == Decimal("10")
