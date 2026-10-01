@@ -48,7 +48,7 @@ class GatewayConfig:
 
 
 class GatewayExecBridge:
-    """HTTP client to Hummingbot Gateway Meteora + Jupiter endpoints."""
+    """HTTP client to Hummingbot Gateway Meteora endpoints."""
 
     def __init__(self, cfg: GatewayConfig):
         self.cfg = cfg
@@ -292,16 +292,17 @@ class GatewayExecBridge:
 
         return result
 
-    def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
-        if bps >= 100:
+    def withdraw(self, position_id: str, percent: int = 100) -> ExecResult:
+        if percent >= 100:
             # Verified shape (D5.2/D5.3): close-position takes only
-            # positionAddress, no liquidityToRemoveBps.
+            # positionAddress, no liquidityPct.
             result = self._post(f"{self._CLMM}/close-position", {"positionAddress": position_id})
             self._positions = {k: v for k, v in self._positions.items() if v != position_id}
         else:
-            # ponytail: remove-liquidity body shape unverified live.
+            # Gateway's field is liquidityPct (0..100, default 100): an unknown key
+            # would be ignored and remove everything. ponytail: unverified live.
             result = self._post(f"{self._CLMM}/remove-liquidity",
-                                 {"positionAddress": position_id, "liquidityToRemoveBps": bps})
+                                 {"positionAddress": position_id, "liquidityPct": percent})
         return result
 
     def swap(
@@ -309,15 +310,21 @@ class GatewayExecBridge:
         in_mint: str,
         out_mint: str,
         amount: float,
-        max_slippage_bps: int = 50,
         pool: Optional[str] = None,
+        max_slippage_bps: int = 50,
     ) -> ExecResult:
-        return self._post(f"{self._CLMM}/execute-swap", {
-            "tokenAddress": in_mint,
-            "tokenAddress2": out_mint,
+        # Exact-in, like ExecBridge.swap: SELL `amount` of baseToken. Gateway's
+        # base/quote are swap-relative, and slippagePct defaults to 2 % if omitted.
+        body = {
+            "baseToken": in_mint,
+            "quoteToken": out_mint,
             "amount": amount,
-            "allowedSlippage": str(max_slippage_bps / 100),
-        })
+            "side": "SELL",
+            "slippagePct": max_slippage_bps / 100,
+        }
+        if pool:
+            body["poolAddress"] = pool
+        return self._post(f"{self._CLMM}/execute-swap", body)
 
     def refresh_bundle(
         self,
@@ -325,7 +332,7 @@ class GatewayExecBridge:
         swap_spec: dict | None,
         deposit_spec: dict,
     ) -> ExecResult:
-        withdraw_r = self.withdraw(withdraw_position_id, bps=100)
+        withdraw_r = self.withdraw(withdraw_position_id, percent=100)
         if not withdraw_r.ok:
             return ExecResult(ok=False, error=f"refresh_bundle: withdraw failed: {withdraw_r.error}")
 
@@ -334,6 +341,8 @@ class GatewayExecBridge:
                 in_mint=swap_spec["in_mint"],
                 out_mint=swap_spec["out_mint"],
                 amount=swap_spec["amount"],
+                # SwapSpec.pool defaults to the pool being redeposited into.
+                pool=swap_spec.get("pool", deposit_spec["pool"]),
                 max_slippage_bps=swap_spec.get("max_slippage_bps", 50),
             )
             if not swap_r.ok:

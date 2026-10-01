@@ -222,13 +222,13 @@ def test_withdraw_full():
     bridge = GatewayExecBridge(cfg)
     bridge._client = httpx.Client(transport=t, base_url="http://mock")
     bridge._positions["pool1"] = "pos1"
-    r = bridge.withdraw("pos1", bps=100)
+    r = bridge.withdraw("pos1", percent=100)
     assert r.ok
     assert "pos1" not in bridge._positions["pool1"] if "pool1" in bridge._positions else True
     bridge._client.close()
 
 
-def test_withdraw_full_body_has_no_bps():
+def test_withdraw_full_body_has_no_amount():
     recorder = []
     t = _transport({
         "/connectors/meteora/clmm/close-position": {"status": 200, "body": {"signature": "sig_w"}},
@@ -236,35 +236,47 @@ def test_withdraw_full_body_has_no_bps():
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
     bridge._client = httpx.Client(transport=t, base_url="http://mock")
-    bridge.withdraw("pos1", bps=100)
+    bridge.withdraw("pos1", percent=100)
     body = next(b for p, b in recorder if p == "/connectors/meteora/clmm/close-position")
     assert body == {"network": "mainnet-beta", "walletAddress": "w1", "positionAddress": "pos1"}
     bridge._client.close()
 
 
 def test_withdraw_partial():
+    recorder = []
     t = _transport({
         "/connectors/meteora/clmm/remove-liquidity": {"status": 200, "body": {"signature": "sig_r"}},
-    })
+    }, recorder=recorder)
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
     bridge._client = httpx.Client(transport=t, base_url="http://mock")
     bridge._positions["pool1"] = "pos1"
-    r = bridge.withdraw("pos1", bps=50)
+    r = bridge.withdraw("pos1", percent=50)
     assert r.ok
     assert bridge._positions.get("pool1") == "pos1"
+    # Gateway's schema field; an unknown key would default to removing 100%.
+    body = next(b for p, b in recorder if p == "/connectors/meteora/clmm/remove-liquidity")
+    assert body["liquidityPct"] == 50
     bridge._client.close()
 
 
 def test_swap():
+    recorder = []
     t = _transport({
         "/connectors/meteora/clmm/execute-swap": {"status": 200, "body": {"signature": "sig_s"}},
-    })
+    }, recorder=recorder)
     cfg = GatewayConfig(wallet="w1")
     bridge = GatewayExecBridge(cfg)
     bridge._client = httpx.Client(transport=t, base_url="http://mock")
-    r = bridge.swap("USDC", "SOL", 1000.0, max_slippage_bps=50)
+    r = bridge.swap("USDC", "SOL", 1000.0, pool="pool1", max_slippage_bps=50)
     assert r.ok
+    # Gateway's schema (required: baseToken, amount, side); exact-in = SELL base.
+    body = next(b for p, b in recorder if p == "/connectors/meteora/clmm/execute-swap")
+    assert body == {
+        "network": "mainnet-beta", "walletAddress": "w1", "poolAddress": "pool1",
+        "baseToken": "USDC", "quoteToken": "SOL", "amount": 1000.0,
+        "side": "SELL", "slippagePct": 0.5,
+    }
     bridge._client.close()
 
 
