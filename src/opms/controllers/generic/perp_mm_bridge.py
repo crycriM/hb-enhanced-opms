@@ -18,9 +18,13 @@ from perp_bot.opms_client import Position
 
 @dataclass
 class OrderSpec:
-    """A venue-agnostic instruction derived from the keeper's last ExecIntent."""
-    cancel_all: bool
-    side: str | None = None            # "buy" | "sell" | None (no new order)
+    """A venue-agnostic quote leg derived from the keeper's last ExecIntent.
+
+    No cancel flag: the controller decides quote cancellation from the
+    executor set it sees (cancel_all was written here but never read; removed
+    2026-10-01).
+    """
+    side: str | None = None            # "buy" | "sell"
     price: float | None = None
     amount: float = 0.0
     reduce_only: bool = False
@@ -174,17 +178,17 @@ def intent_to_order_specs(intent: ExecIntent | None) -> list[OrderSpec]:
         specs = []
         current = intent.current_inventory or 0.0
         if intent.quote.bid_price is not None and intent.quote.bid_size > 0:
-            specs.append(OrderSpec(cancel_all=True, side="buy",
+            specs.append(OrderSpec(side="buy",
                                     price=intent.quote.bid_price,
                                     amount=intent.quote.bid_size,
                                     reduce_only=current < 0,
                                     urgency=intent.urgency))
         if intent.quote.ask_price is not None and intent.quote.ask_size > 0:
-            specs.append(OrderSpec(cancel_all=len(specs) == 0, side="sell",
+            specs.append(OrderSpec(side="sell",
                                     price=intent.quote.ask_price,
                                     amount=intent.quote.ask_size,
                                     reduce_only=current > 0,
                                     urgency=intent.urgency))
-        return specs or [OrderSpec(cancel_all=True)]
+        return specs
 
-    return [OrderSpec(cancel_all=True)]
+    return []
