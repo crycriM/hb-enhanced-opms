@@ -1349,7 +1349,7 @@ async def test_equity_logs_once_per_episode_and_drawdown_blind_once_per_start(ca
         return sum(tag in r.getMessage() and (level is None or r.levelno == level)
                    for r in caplog.records)
 
-    ctrl, connector = _equity_controller({"FOO": Decimal("1")})
+    ctrl, connector = _equity_controller({"FOO": Decimal("1"), "BAR": Decimal("2")})
     for _ in range(3):
         await ctrl.update_processed_data()
     assert count("EQUITY_UNRESOLVED", logging.ERROR) == 1
