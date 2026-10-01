@@ -24,6 +24,7 @@ from hummingbot.core.data_type.in_flight_order import (  # noqa: E402
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount  # noqa: E402
 from hummingbot.core.event.events import MarketEvent  # noqa: E402
 from hummingbot.strategy_v2.models.executors import CloseType  # noqa: E402
+from hummingbot.strategy_v2.models.base import RunnableStatus  # noqa: E402
 
 from opms.executors.passive_aggressive_executor import (  # noqa: E402
     PassiveAggressiveExecutor,
@@ -82,6 +83,7 @@ def _setup(position_action):
         child_order_time_limit=5.0, child_order_refresh_time=60.0, position_action=position_action,
     )
     executor = PassiveAggressiveExecutor(strategy, config)
+    executor._status = RunnableStatus.RUNNING  # what start() sets, without its control loop
     connector.executor = executor
     return executor, tracker, strategy, connector
 
@@ -124,13 +126,15 @@ async def test_hb_delivers_fills_after_cancel_and_executor_credits_them_once():
     assert connector.events.index(MarketEvent.OrderCancelled) < connector.events.index(MarketEvent.OrderFilled)
     assert executor._children[0].filled == Decimal("0.3")
 
-    tracker.process_trade_update(_trade(market, Decimal("0.7"), "t-2"))
+    # The market order was sized before the late 0.3 existed. Its fills and
+    # its completion (HB's cumulative executed amount) credit it once: 1.3
+    # overall, the over-execution a cancel ack cannot rule out.
+    tracker.process_trade_update(_trade(market, Decimal("1"), "t-2"))
     await tracker._process_order_update(OrderUpdate(
         trading_pair=PAIR, update_timestamp=100.0, new_state=OrderState.FILLED,
         client_order_id=market,
     ))
-    # Completion carries the market order's cumulative 1.0 (it was sized
-    # before the late 0.3 arrived): credited once per order, 1.3 overall.
+    assert connector.events.count(MarketEvent.SellOrderCompleted) == 1
     assert executor._cumulative_filled == Decimal("1.3")
     executor._step()
     assert executor.close_type == CloseType.COMPLETED

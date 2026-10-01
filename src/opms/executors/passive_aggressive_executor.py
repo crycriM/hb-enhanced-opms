@@ -11,6 +11,20 @@ Execution model (preserved from dex_executor/algorithms/passive_aggressive_v2.py
   CloseType: COMPLETED only when the full total executed, else TIME_LIMIT
   (or FAILED when retries are exhausted). A skipped child is never COMPLETED.
 
+Fill accounting is per order, for the executor's whole run: HB keeps a
+cancelled order fillable for its cached-order window (30 s), so a fill can
+follow the cancel ack, a replacement, or child advancement. Each order's
+credited amount is max(distinct fills by trade id, cumulative completion), and
+only the increase is added to its owning child and the total. A late fill that
+leaves a resting replacement oversized cancels it before more is submitted.
+
+Settlement limit: neither a cancel ack nor HB's InFlightOrder (updated in the
+same call that emits OrderFilled; HL's _all_trade_updates_for_order is a stub)
+proves the cancelled order stopped filling. The cycle-expiry market order is
+therefore sent only for CLOSE: venue reduce-only cannot flip the position, but
+a late fill can still over-reduce a nonzero target. OPEN never crosses after a
+cancel. Event listeners stay attached until every order reached a terminal event.
+
 Key differences from PA-V2:
   - Order placement / cancellation via HB connector (strategy.buy/sell/cancel).
   - Fill events via HB's MarketEvent.OrderFilled / BuyOrderCompleted /
@@ -96,6 +110,19 @@ class _ChildSlot:
     cancel_reason: str = ""  # "refresh" | "cycle_expired"
 
 
+@dataclass
+class _OrderRecord:
+    """One submitted order. Kept until the executor ends (no eviction): its
+    fills may arrive after cancel, completion, or child advancement."""
+    child: _ChildSlot
+    amount: Decimal
+    fill_sum: Decimal = Decimal("0")   # distinct OrderFilled amounts
+    reported: Decimal = Decimal("0")   # largest cumulative completion summary
+    credited: Decimal = Decimal("0")   # already added to child and executor totals
+    trade_ids: set = field(default_factory=set)
+    terminal: bool = False             # cancel / completion / failure received
+
+
 # ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
@@ -129,6 +156,8 @@ class PassiveAggressiveExecutor(ExecutorBase):
         self._child_idx: int = 0  # index of the currently active child
         self._cumulative_filled: Decimal = Decimal("0")
         self._cum_fees_quote: Decimal = Decimal("0")
+        self._orders: dict[str, _OrderRecord] = {}
+        self._last_cancel_sweep: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -192,7 +221,15 @@ class PassiveAggressiveExecutor(ExecutorBase):
         if self.status == RunnableStatus.RUNNING:
             self._step()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
-            self._cancel_all_open()
+            if self._outstanding():
+                # Detaching now would drop fills of orders still being
+                # cancelled. HB ends every order with a terminal event (a lost
+                # order becomes a failure); re-send cancels at the refresh cadence.
+                now = self._strategy.current_timestamp
+                if (self._last_cancel_sweep is None
+                        or now - self._last_cancel_sweep >= self.config.child_order_refresh_time):
+                    self._cancel_all_open()
+                return
             # early_stop() already chose EARLY_STOP / POSITION_HOLD; an
             # interrupted execution must not report itself as COMPLETED.
             self.close_execution_by(self.close_type or self._final_close_type())
@@ -209,7 +246,8 @@ class PassiveAggressiveExecutor(ExecutorBase):
 
         if self._child_idx >= len(self._children):
             # All children terminal; only a fully executed run is COMPLETED.
-            self.close_execution_by(self._final_close_type())
+            if not self._outstanding():
+                self.close_execution_by(self._final_close_type())
             return
 
         child = self._children[self._child_idx]
@@ -262,17 +300,11 @@ class PassiveAggressiveExecutor(ExecutorBase):
             child.retry_at = self._strategy.current_timestamp + 1.0
             logger.error(f"PA child {self._child_idx}: no valid {price_type} ({price}); not placing")
             return
-        remaining = child.target - child.filled
-        order_id = self.place_order(
-            connector_name=self.config.connector_name,
-            trading_pair=self.config.trading_pair,
-            order_type=OrderType.LIMIT,
-            side=self.config.side,
-            amount=remaining,
-            price=price,
-            position_action=self.config.position_action,
-        )
-        child.tracked_order = TrackedOrder(order_id=order_id)
+        remaining = self._room(child)
+        if remaining <= 0:
+            child.status = _ChildStatus.DONE
+            return
+        order_id = self._submit(child, OrderType.LIMIT, remaining, price)
         child.status = _ChildStatus.ACTIVE
         child.refresh_start = self._strategy.current_timestamp
         logger.info(
@@ -281,24 +313,44 @@ class PassiveAggressiveExecutor(ExecutorBase):
         )
 
     def _place_aggressive(self, child: _ChildSlot):
-        remaining = child.target - child.filled
+        child.status = _ChildStatus.IDLE
+        if self._status != RunnableStatus.RUNNING:
+            return  # never place after a stop
+        remaining = self._room(child)
         if remaining <= 0:
             child.status = _ChildStatus.DONE
             return
-        # Market order: use NaN price so HB selects market price.
-        order_id = self.place_order(
-            connector_name=self.config.connector_name,
-            trading_pair=self.config.trading_pair,
-            order_type=OrderType.MARKET,
-            side=self.config.side,
-            amount=remaining,
-            position_action=self.config.position_action,
-        )
-        child.tracked_order = TrackedOrder(order_id=order_id)
+        order_id = self._submit(child, OrderType.MARKET, remaining)
         child.status = _ChildStatus.AGGRESSIVE
         logger.info(
             f"PA child {self._child_idx}: aggressive market {remaining} [{order_id}]"
         )
+
+    def _submit(self, child: _ChildSlot, order_type: OrderType, amount: Decimal,
+                price: Decimal = Decimal("NaN")) -> str:
+        order_id = self.place_order(
+            connector_name=self.config.connector_name,
+            trading_pair=self.config.trading_pair,
+            order_type=order_type,
+            side=self.config.side,
+            amount=amount,
+            price=price,
+            position_action=self.config.position_action,
+        )
+        self._orders[order_id] = _OrderRecord(child=child, amount=amount)
+        child.tracked_order = TrackedOrder(order_id=order_id)
+        return order_id
+
+    def _outstanding(self) -> Decimal:
+        """Base quantity still working in orders without a terminal event."""
+        return sum((max(r.amount - r.credited, Decimal("0"))
+                    for r in self._orders.values() if not r.terminal), Decimal("0"))
+
+    def _room(self, child: _ChildSlot) -> Decimal:
+        """What may still be submitted: credited fills plus every unsettled
+        order must stay within both the child's target and the total."""
+        return min(child.target - child.filled,
+                   self.config.total_amount_base - self._cumulative_filled) - self._outstanding()
 
     def _cancel_child(self, child: _ChildSlot, reason: str):
         if child.tracked_order and child.tracked_order.order_id:
@@ -311,17 +363,17 @@ class PassiveAggressiveExecutor(ExecutorBase):
             child.status = _ChildStatus.CANCELING
 
     def _cancel_all_open(self):
-        for child in self._children:
-            if child.status in (_ChildStatus.ACTIVE, _ChildStatus.CANCELING, _ChildStatus.AGGRESSIVE):
-                if child.tracked_order and child.tracked_order.order_id:
-                    try:
-                        self._strategy.cancel(
-                            self.config.connector_name,
-                            self.config.trading_pair,
-                            child.tracked_order.order_id,
-                        )
-                    except Exception as e:
-                        logger.warning(f"PA: error canceling order during stop: {e}")
+        self._last_cancel_sweep = self._strategy.current_timestamp
+        for order_id, record in self._orders.items():
+            if not record.terminal:
+                try:
+                    self._strategy.cancel(
+                        self.config.connector_name,
+                        self.config.trading_pair,
+                        order_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"PA: error canceling order during stop: {e}")
 
     def close_execution_by(self, close_type: CloseType):
         self.close_type = close_type
@@ -353,11 +405,31 @@ class PassiveAggressiveExecutor(ExecutorBase):
             return self._children[self._child_idx]
         return None
 
-    def _is_our_order(self, order_id: str) -> bool:
-        child = self._active_child()
-        return (child is not None and
-                child.tracked_order is not None and
-                child.tracked_order.order_id == order_id)
+    def _record(self, order_id: str, *, terminal: bool = False) -> Optional[_OrderRecord]:
+        record = self._orders.get(order_id)
+        if record is not None and terminal:
+            record.terminal = True
+        return record
+
+    @staticmethod
+    def _is_active(record: _OrderRecord, order_id: str) -> bool:
+        """Lifecycle transitions belong to the child's current order only."""
+        tracked = record.child.tracked_order
+        return tracked is not None and tracked.order_id == order_id
+
+    def _credit(self, record: _OrderRecord) -> None:
+        """Reconcile one order's fills and completion summaries to one total."""
+        delta = max(record.fill_sum, record.reported) - record.credited
+        if delta <= 0:
+            return
+        record.credited += delta
+        record.child.filled += delta
+        self._cumulative_filled += delta
+        if self._cumulative_filled > self.config.total_amount_base:
+            logger.error(
+                f"PA executed {self._cumulative_filled} > total {self.config.total_amount_base}: "
+                f"a fill landed after its order was cancelled and replaced"
+            )
 
     def process_order_filled_event(
         self,
@@ -365,18 +437,28 @@ class PassiveAggressiveExecutor(ExecutorBase):
         market: ConnectorBase,
         event: OrderFilledEvent,
     ):
-        if not self._is_our_order(event.order_id):
+        record = self._record(event.order_id)
+        if record is None:
             return
-        child = self._active_child()
-        incremental = event.amount
-        child.filled += incremental
-        self._cumulative_filled += incremental
+        trade_id = getattr(event, "exchange_trade_id", None)
+        if trade_id:
+            if trade_id in record.trade_ids:
+                return  # a replayed fill
+            record.trade_ids.add(trade_id)
+        record.fill_sum += event.amount
         fee = event.trade_fee.flat_fees[0].amount if event.trade_fee.flat_fees else Decimal("0")
         self._cum_fees_quote += fee
+        self._credit(record)
         logger.debug(
-            f"PA child {self._child_idx}: fill +{incremental} "
-            f"(child={child.filled}/{child.target}, total={self._cumulative_filled})"
+            f"PA fill +{event.amount} [{event.order_id}] "
+            f"(child={record.child.filled}/{record.child.target}, total={self._cumulative_filled})"
         )
+        # A fill on a retired order can leave the resting replacement too big:
+        # cancel it; the re-placement after the ack uses the true residual.
+        child = self._active_child()
+        if (child is not None and child.status == _ChildStatus.ACTIVE
+                and not self._is_active(record, event.order_id) and self._room(child) < 0):
+            self._cancel_child(child, reason="refresh")
 
     def process_order_completed_event(
         self,
@@ -384,21 +466,17 @@ class PassiveAggressiveExecutor(ExecutorBase):
         market: ConnectorBase,
         event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent],
     ):
-        if not self._is_our_order(event.order_id):
+        record = self._record(event.order_id, terminal=True)
+        if record is None:
             return
-        child = self._active_child()
-        # Ensure fill accounting is consistent with the completed event.
-        # (process_order_filled_event may have already counted partial fills.)
-        executed = event.base_asset_amount
-        discrepancy = executed - child.filled
-        if discrepancy > 0:
-            child.filled = executed
-            self._cumulative_filled += discrepancy
-
-        child.status = _ChildStatus.DONE
-        logger.info(
-            f"PA child {self._child_idx}: completed (total filled {self._cumulative_filled})"
-        )
+        # The completion summary is the order's cumulative execution; fills
+        # may come before or after it.
+        record.reported = max(record.reported, event.base_asset_amount)
+        self._credit(record)
+        if not self._is_active(record, event.order_id):
+            return
+        record.child.status = _ChildStatus.DONE
+        logger.info(f"PA order {event.order_id} completed (total filled {self._cumulative_filled})")
 
     def process_order_canceled_event(
         self,
@@ -406,14 +484,20 @@ class PassiveAggressiveExecutor(ExecutorBase):
         market: ConnectorBase,
         event: OrderCancelledEvent,
     ):
-        if not self._is_our_order(event.order_id):
+        record = self._record(event.order_id, terminal=True)
+        if record is None or not self._is_active(record, event.order_id):
             return
-        child = self._active_child()
-        reason = child.cancel_reason
+        child = record.child
         child.tracked_order = None
-
-        if reason == "cycle_expired":
+        if child.cancel_reason == "cycle_expired" and self.config.position_action == PositionAction.CLOSE:
             self._place_aggressive(child)
+        elif child.cancel_reason == "cycle_expired":
+            # OPEN: an unsettled cancel plus a market order can overtrade.
+            child.status = _ChildStatus.SKIPPED
+            logger.warning(
+                f"PA OPEN child: cycle expired; not crossing for {child.target - child.filled} "
+                f"because fills of the cancelled order are not settled"
+            )
         else:
             # refresh — go back to IDLE, next control_task tick re-places
             child.status = _ChildStatus.IDLE
@@ -424,9 +508,10 @@ class PassiveAggressiveExecutor(ExecutorBase):
         market: ConnectorBase,
         event: MarketOrderFailureEvent,
     ):
-        if not self._is_our_order(event.order_id):
+        record = self._record(event.order_id, terminal=True)
+        if record is None or not self._is_active(record, event.order_id):
             return
-        child = self._active_child()
+        child = record.child
         error_message = str(getattr(event, "error_message", "") or "").lower()
         if (
             self.config.position_action == PositionAction.CLOSE
