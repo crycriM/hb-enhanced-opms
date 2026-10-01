@@ -325,6 +325,25 @@ def test_current_equity_falls_back_when_configured_label_absent():
     assert ctrl._current_equity() == Decimal("250")
 
 
+@pytest.mark.parametrize("balances", [
+    {},                                              # restart: connector has not read yet
+    {"FOO": Decimal("1"), "BAR": Decimal("2")},      # unresolvable labels
+    {"USD": Decimal("NaN")},                         # present but non-finite
+])
+def test_current_equity_unresolved_is_no_reading_not_zero(balances):
+    """No reading is None: 0 reads as a real empty account, NaN as STOP_QUOTING."""
+    ctrl = object.__new__(PerpMMController)
+    ctrl.config = _config(collateral_asset="USDC")
+    ctrl.market_data_provider = _MarketDataWithConnector(balances)
+    assert ctrl._current_equity() is None
+
+
+def test_current_equity_present_zero_collateral_is_a_reading():
+    """Key presence, not truthiness: HB writes "USD" only after an account read."""
+    ctrl = _controller(_MarketDataWithConnector({"USD": Decimal("0"), "HYPE": Decimal("5")}))
+    assert ctrl._current_equity() == Decimal("0")
+
+
 # --- de-risk path fixes (2026-09-15) ----------------------------------------
 
 
@@ -1112,3 +1131,241 @@ def test_margin_429_uses_circuit_breaker_instead_of_hammering():
     assert asyncio.run(ctrl._current_margin_available()) == 0.0
     assert calls == [1]
     assert ctrl._venue_circuit.snapshot(ctrl.market_data_provider.time())["rate_limited"] is True
+
+
+# --- unknown equity: cancel quotes without a false flatten (2026-10-01) -------
+# An unresolved balance must neither read as 0 (a 100% drawdown after a peak)
+# nor reach RiskPolicy as NaN (STOP_QUOTING -> zero-target reduce-only flatten).
+
+
+class _EquityConnector(_ConnectorWithSpotState):
+    def __init__(self, balances, position):
+        super().__init__(_spot_state())
+        self.balances = balances
+        self.account_positions = {"k": _position(position)} if Decimal(position) else {}
+
+    def get_all_balances(self):
+        return dict(self.balances)
+
+
+def _equity_controller(balances, position="0.5", **overrides):
+    import asyncio
+
+    connector = _EquityConnector(balances, position)
+    ctrl = PerpMMController(_config(**overrides), _MarketDataWithSpot(connector), asyncio.Queue())
+    return ctrl, connector
+
+
+def _resting_quote():
+    ctrl = _controller()
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", account_id="e2_mm1",
+        target_inventory=0.0, current_inventory=0.0,
+        quote=QuoteSpec(bid_price=2999.0, ask_price=3001.0, bid_size=0.01, ask_size=0.01),
+        urgency="passive",
+    )
+    config = ctrl.determine_executor_actions()[0].executor_config
+    return _ExecInfo("quote-1", config, {"order_id": "oid-1", "exchange_order_id": "x-1"})
+
+
+def _running_close(urgency="immediate"):
+    config = _controller()._execution_actions(
+        ExecutionRequest(side="sell", amount=0.5, urgency=urgency, reduce_only=True)
+    )[0].executor_config
+    return _ExecInfo("close-1", config)
+
+
+def _no_flatten(intent) -> bool:
+    from opms.controllers.generic.perp_mm_bridge import intent_to_execution_request
+
+    return intent_to_execution_request(intent) is None
+
+
+async def test_unresolved_equity_at_startup_cancels_quotes_without_close():
+    from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+
+    ctrl, _ = _equity_controller({})
+    await ctrl.update_processed_data()
+
+    assert _no_flatten(ctrl._client.last_intent)
+    _with_active(ctrl, [_resting_quote()])
+    actions = ctrl.determine_executor_actions()
+    assert [type(a) for a in actions] == [StopExecutorAction]
+    assert actions[0].executor_id == "quote-1"
+    _with_active(ctrl, [])
+    assert ctrl.determine_executor_actions() == []
+
+
+async def test_unknown_equity_after_peak_is_cancel_only_without_synthetic_drawdown():
+    from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+    from opms.controllers.generic.perp_mm_bridge import intent_is_quoting
+
+    ctrl, connector = _equity_controller({"USD": Decimal("1000")})
+    await ctrl.update_processed_data()
+    assert intent_is_quoting(ctrl._client.last_intent)
+
+    connector.balances = {}
+    await ctrl.update_processed_data()
+
+    assert ctrl.keeper._risk._peak_equity == pytest.approx(1000.0)
+    assert _no_flatten(ctrl._client.last_intent)
+    _with_active(ctrl, [_resting_quote()])
+    assert [type(a) for a in ctrl.determine_executor_actions()] == [StopExecutorAction]
+    _with_active(ctrl, [])
+    assert ctrl.determine_executor_actions() == []  # no quote refresh/creation
+    info = ctrl.get_custom_info()
+    assert info["equity_resolved"] is False
+    assert info["peak_equity_seeded"] is True
+    assert info["quote_suspension_reason"] == "equity_unresolved"
+
+
+async def test_nan_equity_sentinel_never_becomes_a_zero_target_flatten():
+    ctrl, _ = _equity_controller({"USD": Decimal("NaN")}, position="0.5")
+    await ctrl.update_processed_data()
+
+    assert _no_flatten(ctrl._client.last_intent)
+    _with_active(ctrl, [])
+    assert ctrl.determine_executor_actions() == []
+
+
+def _basket(tmp_path, monkeypatch, sibling_modes=("quote", "quote", "quote")):
+    db = str(tmp_path / "portfolio.db")
+    monkeypatch.setenv("OPMS_PORTFOLIO_STOP_DB", db)
+    monkeypatch.setenv("OPMS_PORTFOLIO_MEMBERS", "e2_mm1:ETH,e2_mm1:SOL,e2_mm2:ETH,e2_mm2:SOL")
+    book = PortfolioStopBook(db, {("e2_mm1", "ETH"), ("e2_mm1", "SOL"),
+                                  ("e2_mm2", "ETH"), ("e2_mm2", "SOL")})
+    for (account, coin, position, mid), mode in zip(
+        [("e2_mm1", "SOL", -4.0, 100.0), ("e2_mm2", "ETH", -0.3, 3000.0),
+         ("e2_mm2", "SOL", 2.0, 100.0)], sibling_modes,
+    ):
+        book.update(account, coin, position, mid, mode)
+    return book
+
+
+async def test_unknown_equity_with_structural_target_requests_no_basket_stop(tmp_path, monkeypatch):
+    book = _basket(tmp_path, monkeypatch)
+    ctrl, _ = _equity_controller({}, position="0.4", target_inventory=0.4)
+    await ctrl.update_processed_data()
+
+    assert _no_flatten(ctrl._client.last_intent)
+    _with_active(ctrl, [])
+    assert ctrl.determine_executor_actions() == []
+    # The sibling legs see no stop request from this leg either.
+    assert book.update("e2_mm2", "SOL", 2.0, 100.0, "quote") == ("quote", 2.0)
+
+
+async def test_unknown_equity_keeps_a_sibling_portfolio_emergency(tmp_path, monkeypatch):
+    from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
+
+    _basket(tmp_path, monkeypatch, sibling_modes=("quote", "emergency", "quote"))
+    ctrl, _ = _equity_controller({}, position="0.4", target_inventory=0.4)
+    await ctrl.update_processed_data()
+
+    intent = ctrl._client.last_intent
+    assert intent.urgency == "emergency" and intent.target_inventory == 0.0
+    _with_active(ctrl, [])
+    actions = ctrl.determine_executor_actions()
+    assert [type(a) for a in actions] == [CreateExecutorAction]
+    assert actions[0].executor_config.position_action.name == "CLOSE"
+
+
+async def test_unknown_equity_keeps_an_accepted_emergency_and_its_executor():
+    ctrl, connector = _equity_controller({"USD": Decimal("1000")}, position="0.5")
+    await ctrl.update_processed_data()
+    ctrl._client.last_intent = ExecIntent(
+        venue="hyperliquid", coin="ETH", account_id="e2_mm1",
+        target_inventory=0.0, current_inventory=0.5, quote=None, urgency="emergency",
+    )
+
+    connector.balances = {}
+    await ctrl.update_processed_data()
+
+    assert ctrl._client.last_intent.urgency == "emergency"
+    _with_active(ctrl, [_running_close("emergency")])
+    assert ctrl.determine_executor_actions() == []  # same request: keep it running
+
+
+async def test_unknown_equity_stops_quotes_but_not_a_running_close():
+    from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+
+    ctrl, connector = _equity_controller({"USD": Decimal("1000")})
+    await ctrl.update_processed_data()
+    connector.balances = {}
+    await ctrl.update_processed_data()
+
+    _with_active(ctrl, [_resting_quote(), _running_close()])
+    actions = ctrl.determine_executor_actions()
+    assert [(type(a), a.executor_id) for a in actions] == [(StopExecutorAction, "quote-1")]
+
+
+async def test_genuine_zero_keeps_shared_policy_semantics():
+    from opms.controllers.generic.perp_mm_bridge import intent_is_quoting
+
+    # Startup zero is a reading, not a peak: quoting continues, drawdown not armed.
+    ctrl, _ = _equity_controller({"USD": Decimal("0"), "HYPE": Decimal("5")})
+    await ctrl.update_processed_data()
+    assert intent_is_quoting(ctrl._client.last_intent)
+    info = ctrl.get_custom_info()
+    assert info["equity_resolved"] is True and info["peak_equity_seeded"] is False
+
+    # Zero after a positive peak is a real 100% drawdown.
+    ctrl, connector = _equity_controller({"USD": Decimal("1000")})
+    await ctrl.update_processed_data()
+    connector.balances = {"USD": Decimal("0"), "HYPE": Decimal("5")}
+    await ctrl.update_processed_data()
+    assert ctrl._client.last_intent.urgency == "emergency"
+    assert ctrl._client.last_intent.target_inventory == 0.0
+
+
+async def test_resolved_equity_clears_suspension_and_arms_the_session_peak():
+    from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
+    from opms.controllers.generic.perp_mm_bridge import intent_is_quoting
+
+    ctrl, connector = _equity_controller({})
+    await ctrl.update_processed_data()
+    info = ctrl.get_custom_info()
+    assert (info["equity_resolved"], info["peak_equity_seeded"]) == (False, False)
+
+    connector.balances = {"USD": Decimal("300")}
+    await ctrl.update_processed_data()
+
+    info = ctrl.get_custom_info()
+    assert info["equity_resolved"] is True
+    assert info["peak_equity_seeded"] is True
+    assert info["quote_suspension_reason"] is None
+    assert ctrl.keeper._risk._peak_equity == pytest.approx(300.0)
+    assert intent_is_quoting(ctrl._client.last_intent)
+    _with_active(ctrl, [])
+    actions = ctrl.determine_executor_actions()
+    assert actions and all(isinstance(a, CreateExecutorAction) for a in actions)
+
+
+async def test_equity_logs_once_per_episode_and_drawdown_blind_once_per_start(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+
+    def count(tag, level=None):
+        return sum(tag in r.getMessage() and (level is None or r.levelno == level)
+                   for r in caplog.records)
+
+    ctrl, connector = _equity_controller({"FOO": Decimal("1")})
+    for _ in range(3):
+        await ctrl.update_processed_data()
+    assert count("EQUITY_UNRESOLVED", logging.ERROR) == 1
+    message = next(r.getMessage() for r in caplog.records if "EQUITY_UNRESOLVED" in r.getMessage())
+    for detail in ("hyperliquid_perpetual", "e2_mm1", "ETH-USD", "'USD'", "FOO"):
+        assert detail in message
+    assert count("DRAWDOWN_BLIND") == 1
+
+    connector.balances = {"USD": Decimal("300")}
+    for _ in range(2):
+        await ctrl.update_processed_data()
+    assert count("EQUITY_RESOLVED") == 1
+    assert count("DRAWDOWN_BASELINE_ARMED") == 1
+
+    connector.balances = {}
+    for _ in range(2):
+        await ctrl.update_processed_data()
+    assert count("EQUITY_UNRESOLVED", logging.ERROR) == 2
+    assert count("DRAWDOWN_BLIND") == 1
