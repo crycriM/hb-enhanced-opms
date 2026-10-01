@@ -8,6 +8,10 @@ permanent controller set — a throwaway harness to drive one TWAPExecutor
 buy of `total_amount_quote`, then one TWAPExecutor sell of the same size,
 then stop. Position-over-time is observed externally (direct HL API
 polling), not by this controller.
+
+PARKED (2026-10-01): validation/demo controller, historical purpose only. No
+active config references it (Hummingbot conf/, deploy/, rollout docs checked
+with ``rg -i twap_roundtrip``); kept for reproducing the 2026-07-10 comparison.
 """
 
 import logging

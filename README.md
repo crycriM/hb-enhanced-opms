@@ -49,6 +49,7 @@ owns cancellation acknowledgements and account routing.
 |--------|---------|
 | `perp_mm_controller` | Hummingbot `ControllerBase` integration. The **only** module with `import hummingbot`. Drives Keeper via `InProcessClient` and translates `ExecIntent` → HB `ExecutorAction`. |
 | `perp_mm_bridge` | HB-free bridge. `InProcessClient` duck-types `OpmsClient` for in-process Keeper communication. `intent_to_order_specs()` maps keeper decisions to venue-agnostic order specs. |
+| `twap_roundtrip_controller` | **Parked** validation/demo controller (2026-07-10 PA-V2 vs HB TWAP comparison). No active config uses it. |
 
 The perp controller uses `perp_bot`'s shared fail-closed margin-health
 invariant. A failed, missing, malformed, or non-finite
@@ -84,7 +85,7 @@ non-finite equity.
 
 | Module | Purpose |
 |--------|---------|
-| `exec_bridge` | `GatewayExecBridge` — HTTP client to the Hummingbot Gateway's DEX (Meteora/Jupiter) endpoints. HB-free (`httpx`), tested against a mock server. Only code that talks to the Gateway; needed for DEX venues, not for perp. |
+| `exec_bridge` | `GatewayExecBridge` — HTTP client to the Hummingbot Gateway's DEX (Meteora/Jupiter) endpoints. HB-free (`httpx`), tested against a mock server. Only code that talks to the Gateway; needed for DEX venues, not for perp. **Intentionally retained, parked:** legacy compatibility/read seam, not a production write path — keeper writes go through `solana-clmm-executor`, and `deposit_single_sided` must not be used in production (see the module docstring for the open per-bin/zero-tolerance/storage/contract issues). |
 
 ### `opms.analytics`
 
@@ -420,7 +421,7 @@ hb-enhanced-opms/
 │   ├── forecasting/
 │   │   └── historical_profile.py
 │   ├── gateway/             # GatewayExecBridge — HTTP client to the Hummingbot Gateway (DEX only)
-│   ├── research/            # (reserved)
+│   ├── research/            # rollout/shadow CLIs, e.g. shadow_step_a2 (Step A.2 driver, `--fake` offline)
 │   └── risk/                # (reserved)
 └── tests/
     ├── conftest.py          # HB stubs + sys.modules injection

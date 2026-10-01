@@ -20,6 +20,12 @@ Bridge modes:
                   also need the executor's M4/M5 + signing gate
                   (``solana-clmm-executor`` test plan §5).
 
+Retained (2026-10-01): this CLI is the documented Step A.2 rollout driver
+(clmm-animation docs/common-mm-implementation-plan-streams-BCDE.md, D5 item 2);
+having no importer does not make it dead code. ``--fake`` is the offline
+check; the subprocess mode stays behind its CONFIRM/DRY_RUN and executor
+signing gates and is never exercised by ordinary tests.
+
 Usage:
   python -m opms.research.shadow_step_a2 --fake
   POOL=... WALLET=... python -m opms.research.shadow_step_a2 \

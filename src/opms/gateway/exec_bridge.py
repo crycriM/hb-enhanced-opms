@@ -8,6 +8,17 @@ changes a line.
 
 HB-free: no hummingbot imports.  All tests run against a mock HTTP server
 (httpx.MockTransport or responses library).
+
+intentionally-retained (2026-10-01): parked legacy compatibility seam, not a
+production write path. Gateway is kept for reads/legacy compatibility; the
+keeper's write authority is the TS ``solana-clmm-executor`` (clmm-animation
+docs/common-mm-implementation-plan-streams-BCDE.md, D5 rollout).
+``deposit_single_sided`` keeps its production-use prohibition. Unresolved
+before anyone revives Gateway writes: explicit per-bin weights (Gateway only
+takes a canned strategy range), integer zero-bin tolerance (rejected here
+because old SDK paths read slippage 0 as "unset"), one stored position per
+pool (``_positions`` is keyed by pool), and request-body contracts never
+verified against a live Gateway.
 """
 
 from __future__ import annotations
