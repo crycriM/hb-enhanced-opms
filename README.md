@@ -56,6 +56,22 @@ invariant. A failed, missing, malformed, or non-finite
 fed to the keeper as zero available margin, forcing an emergency-exit decision
 instead of silently disabling the stop.
 
+Equity is the opposite case: an absent collateral key (empty balances right
+after a restart, unresolved labels) or a non-finite value is *no reading*, not
+zero. The controller then skips the risk evaluation, cancels its resting quotes
+and creates none (`quote_suspension_reason="equity_unresolved"`), while
+position reconciliation, accepted non-quoting intents, running closes, and
+basket stops/emergencies from other legs carry on. It never flattens because
+equity is unknown. A present zero is a genuine reading and keeps the shared
+`RiskPolicy` semantics. `get_custom_info()` reports `equity_resolved`,
+`peak_equity_seeded`, and `quote_suspension_reason`; logs carry
+`EQUITY_UNRESOLVED`/`EQUITY_RESOLVED` once per episode and `DRAWDOWN_BLIND`/
+`DRAWDOWN_BASELINE_ARMED` once per start. **The drawdown peak is
+session-local:** it is not persisted, so drawdown from before a restart is not
+tracked. While equity is unknown, *new* margin-ratio emergencies cannot be
+evaluated. The smoke, de-risk gate, and soak preflight fail on unresolved or
+non-finite equity.
+
 ### `opms.executors`
 
 | Module | Purpose |

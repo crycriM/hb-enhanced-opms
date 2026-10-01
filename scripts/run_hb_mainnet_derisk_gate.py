@@ -51,7 +51,9 @@ from run_hb_mainnet_quote_gate import (  # noqa: E402  (shared gate plumbing)
     _stop_executors,
     _venue_position,
 )
-from run_hb_mainnet_smoke import CONNECTOR_NAME, PAIR, _build_connector, _resolve_account, _wait_ready  # noqa: E402
+from run_hb_mainnet_smoke import (  # noqa: E402
+    CONNECTOR_NAME, PAIR, _build_connector, _resolve_account, _wait_ready, equity_gate_failure,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SIZE_EPS = 1e-9
@@ -98,7 +100,7 @@ def _account_indicators(info, address: str, controller) -> dict:
     usdc = next((b for b in spot["balances"] if b["coin"] == "USDC"), {})
     avail = dict((int(t), v) for t, v in spot.get("tokenToAvailableAfterMaintenance", []))
     return {
-        "hb_equity": float(controller._current_equity()),
+        "hb_equity": None if (equity := controller._current_equity()) is None else float(equity),
         "spot_usdc_total": float(usdc.get("total", 0)),
         "spot_usdc_hold": float(usdc.get("hold", 0)),
         "spot_available_after_maintenance": float(avail.get(0, 0)),
@@ -438,8 +440,11 @@ async def main() -> int:
             if not (reopened["venue_ok"] and reopened["reconciled"]):
                 failures.append(f"reopen failed: {reopened}")
                 raise RuntimeError("reopen failed")
-            equity = float(controller._current_equity())
-            controller.keeper._risk._peak_equity = equity / 0.8  # 20% drawdown > 10% stop
+            equity = controller._current_equity()
+            if failure := equity_gate_failure(equity):
+                failures.append(f"{failure}; drawdown phase not staged")
+                raise RuntimeError(failure)
+            controller.keeper._risk._peak_equity = float(equity) / 0.8  # 20% drawdown > 10% stop
             orders_before = len(strategy.orders)
             samples = []
             started = time.time()

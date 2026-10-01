@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -83,6 +84,25 @@ def snapshot_account(info, address: str, coins: set[str]) -> dict:
     }
 
 
+def equity_check(state: dict, min_equity: float) -> tuple[float | None, str | None]:
+    """(equity, failure): spot USDC (unified accounts) else perp account value.
+
+    Key presence decides which is used; a missing or non-finite reading fails
+    the gate instead of reading as 0, which would pass a zero minimum.
+    """
+    key = next((k for k in ("spot_usdc_total", "account_value") if state.get(k) is not None), None)
+    try:
+        equity = float(state[key]) if key else math.nan
+    except (TypeError, ValueError):
+        equity = math.nan
+    if not math.isfinite(equity):
+        return None, (f"collateral equity unresolved (spot_usdc_total={state.get('spot_usdc_total')!r}, "
+                      f"account_value={state.get('account_value')!r}); refusing to start")
+    if equity < min_equity:
+        return equity, f"equity ${equity:.2f} is below required ${min_equity:.2f}"
+    return equity, None
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--account-id", default="e2_mm1")
@@ -104,15 +124,12 @@ def main(argv=None) -> int:
         "state": snapshot_account(info, address, set(args.coins)),
     }
     state = result["state"]
-    try:
-        equity = float(state.get("spot_usdc_total") or state.get("account_value") or 0.0)
-    except (TypeError, ValueError):
-        equity = 0.0
+    equity, equity_failure = equity_check(state, args.min_equity)
     failures: list[str] = []
     if str(is_testnet).lower() != "false":
         failures.append("credential environment is not explicitly mainnet")
-    if equity < args.min_equity:
-        failures.append(f"equity ${equity:.2f} is below required ${args.min_equity:.2f}")
+    if equity_failure:
+        failures.append(equity_failure)
     if args.require_clean:
         if state["orders"]:
             failures.append(f"{len(state['orders'])} scoped open order(s) already exist")

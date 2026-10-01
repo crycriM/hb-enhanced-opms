@@ -17,6 +17,7 @@ with `vaultAddress`, exactly as the live deployment will.
 
 import argparse
 import asyncio
+import math
 import os
 import sys
 import time
@@ -29,6 +30,16 @@ load_dotenv(REPO_ROOT / ".env")
 
 PAIR = "ETH-USD"
 CONNECTOR_NAME = "hyperliquid_perpetual"
+
+
+def equity_gate_failure(equity) -> str | None:
+    """Gate on the controller's explicit reading (None = no collateral balance resolved)."""
+    if equity is None or not math.isfinite(equity):
+        return (f"equity unresolved ({equity}); check collateral_asset against the "
+                f"connector's balance keys before staging anything")
+    if equity <= 0:
+        return f"non-positive equity ({equity})"
+    return None
 
 
 def _master_address(account_id: str) -> str:
@@ -163,12 +174,18 @@ async def main() -> int:
         await controller.update_processed_data()
         equity = controller._current_equity()
         print(f"equity={equity}")
-        if equity <= 0:
-            failures.append(f"non-positive equity ({equity})")
+        if failure := equity_gate_failure(equity):
+            failures.append(failure)
         info = controller.get_custom_info()
         print(f"custom_info_keys={sorted(info)}")
-        if set(info) != {"fill_pnl", "markout", "slippage"}:
-            failures.append(f"unexpected custom_info shape: {sorted(info)}")
+        missing = {"fill_pnl", "markout", "slippage", "equity_resolved",
+                   "peak_equity_seeded", "quote_suspension_reason"} - set(info)
+        if missing:
+            failures.append(f"custom_info lacks {sorted(missing)}")
+        elif info["equity_resolved"] is not True or not info["peak_equity_seeded"]:
+            failures.append(f"equity health not armed: resolved={info['equity_resolved']} "
+                            f"peak_seeded={info['peak_equity_seeded']} "
+                            f"suspension={info['quote_suspension_reason']}")
         controller.on_stop()
     finally:
         await connector.stop_network()

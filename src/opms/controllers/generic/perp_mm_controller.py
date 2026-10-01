@@ -274,6 +274,10 @@ class PerpMMController(ControllerBase):
             self._quote_refresh_pending = False
         if not hasattr(self, "_market_data_unready"):
             self._market_data_unready = False
+        if not hasattr(self, "_equity_resolved"):
+            self._equity_resolved: bool | None = None
+            self._quote_suspension_reason: str | None = None
+            self._drawdown_baseline: str | None = None  # None -> "blind" -> "armed"
 
     async def on_start(self):
         connector = self.market_data_provider.get_connector(self.config.connector_name)
@@ -397,6 +401,7 @@ class PerpMMController(ControllerBase):
         return result
 
     async def update_processed_data(self):
+        self._ensure_resilience_state()
         await self._refresh_positions_after_fills()
         # Read the fair price AFTER the potentially slow REST margin call.
         # Previously a seconds-old mid was stamped with the current time.
@@ -413,21 +418,87 @@ class PerpMMController(ControllerBase):
         self.keeper.config.size_step = float(rules.min_base_amount_increment or 0) or None
 
         current_position = self._position_for_decision()
-        self._client.set_positions({
+        equity = self._current_equity()
+        positions = {
             self.config.coin: Position(
                 coin=self.config.coin,
                 position=current_position,
-                equity=float(self._current_equity()),
+                # NaN only marks "unknown" in the keeper's copy; the tick that
+                # would evaluate it is skipped below.
+                equity=float(equity) if equity is not None else math.nan,
                 margin_available=margin_available,
             )
-        })
+        }
+        self._client.set_positions(positions)
 
         await self.keeper._on_snapshot({
             "ts": self.market_data_provider.time(),
             "mid": float(mid),
             "funding_rate": funding_rate,
         })
-        await self.keeper._tick()
+        self._note_equity(equity)
+        if equity is not None:
+            await self.keeper._tick()
+        else:
+            # Suspend quoting without a risk evaluation: reconcile position,
+            # keep any accepted non-quoting intent latched, and still honour a
+            # basket stop/emergency requested by another leg. This leg asks for
+            # no basket action itself ("quote" in the book's vocabulary).
+            # determine_executor_actions cancels the resting quotes.
+            # ponytail: new margin-ratio emergencies cannot be evaluated while
+            # equity is unknown (ratio undefined); accepted ones stay latched.
+            self.keeper._apply_positions(positions)
+            intent = self._portfolio_transform(
+                Decision.HOLD, None, self.keeper._inventory.position, float(mid),
+            )
+            if (intent is not None and not self.keeper.shadow_mode
+                    and abs(intent.target_inventory - intent.current_inventory) >= 1e-12):
+                await self._client.send_intent(intent)
+        self._note_peak_equity()
+
+    def _note_equity(self, equity: Decimal | None) -> None:
+        """Log unresolved-equity episodes once, and set the quote suspension."""
+        resolved = equity is not None
+        if not resolved and self._equity_resolved is not False:
+            balances = self.market_data_provider.get_connector(
+                self.config.connector_name).get_all_balances()
+            logger.error(
+                "EQUITY_UNRESOLVED connector=%s account=%s pair=%s collateral_asset=%r "
+                "balance_keys=%s: no finite collateral reading; quotes suspended "
+                "(cancel-only, no flatten from unknown equity) until it resolves",
+                self.config.connector_name, self.config.account_id,
+                self.config.trading_pair, self.config.collateral_asset, sorted(balances),
+            )
+        elif resolved and self._equity_resolved is False:
+            logger.warning(
+                "EQUITY_RESOLVED %s/%s equity=%s; quote suspension cleared",
+                self.config.account_id, self.config.trading_pair, equity,
+            )
+        self._equity_resolved = resolved
+        self._quote_suspension_reason = None if resolved else "equity_unresolved"
+
+    def _peak_equity_seeded(self) -> bool:
+        peak = self.keeper._risk._peak_equity
+        return math.isfinite(peak) and peak > 0
+
+    def _note_peak_equity(self) -> None:
+        """The drawdown peak is session-local: say when it is blind and when armed."""
+        if self._peak_equity_seeded():
+            if self._drawdown_baseline != "armed":
+                logger.warning(
+                    "DRAWDOWN_BASELINE_ARMED %s/%s session peak equity=%s",
+                    self.config.account_id, self.config.trading_pair,
+                    self.keeper._risk._peak_equity,
+                )
+                self._drawdown_baseline = "armed"
+        elif self._drawdown_baseline is None:
+            logger.warning(
+                "DRAWDOWN_BLIND %s/%s: no positive session peak equity yet; the drawdown "
+                "stop is inactive until one arrives. The peak is session-local: drawdown "
+                "from before this start is not tracked.",
+                self.config.account_id, self.config.trading_pair,
+            )
+            self._drawdown_baseline = "blind"
 
     def _portfolio_transform(
         self, decision: Decision, intent: ExecIntent | None, position: float, mid: float,
@@ -567,29 +638,31 @@ class PerpMMController(ControllerBase):
             connector._opms_margin_retry_at = 0.0
             return value
 
-    def _current_equity(self) -> Decimal:
-        # Cross-margined account value (collateral + unrealized PnL), resolved
-        # against the connector's actual balances. HB's Hyperliquid connector
-        # labels the balance "USD" (CONSTANTS.CURRENCY), not "USDC" — trusting
-        # the label alone yields a silent 0 equity.
+    def _current_equity(self) -> Decimal | None:
+        """Cross-margined account value, or None when there is no reading.
+
+        HB's Hyperliquid connector labels the balance "USD" (CONSTANTS.CURRENCY),
+        not "USDC", and writes it only after a successful account read. So key
+        presence decides: a present 0 is a real empty account; an absent key
+        (empty balances after a restart, unknown labels) or a non-finite value
+        is unknown. Unknown must never become 0 (after a positive peak that is
+        a 100% drawdown) or NaN in RiskPolicy (STOP_QUOTING, whose zero-target
+        intent is a reduce-only flatten). update_processed_data handles None.
+        """
         balances = self.market_data_provider.get_connector(
             self.config.connector_name
         ).get_all_balances()
-        if balances.get(self.config.collateral_asset):
-            return Decimal(str(balances[self.config.collateral_asset]))
-        for asset in ("USD", "USDC", "USDT"):
-            if balances.get(asset):
-                return Decimal(str(balances[asset]))
-        if len(balances) == 1:
-            return Decimal(str(next(iter(balances.values()))))
-        # Equity 0 switches off the margin-health and drawdown stops (RiskPolicy guards the
-        # division), so an unresolvable collateral label must never pass quietly.
-        logger.error(
-            "%s: no collateral balance found (asset=%r, balances=%s); equity reads 0 and the "
-            "margin/drawdown stops are blind", self.config.trading_pair,
-            self.config.collateral_asset, sorted(balances),
-        )
-        return Decimal("0")
+        labels = (self.config.collateral_asset, "USD", "USDC", "USDT")
+        key = next((label for label in labels if label in balances), None)
+        if key is None and len(balances) == 1:
+            key = next(iter(balances))
+        if key is None:
+            return None
+        try:
+            value = Decimal(str(balances[key]))
+        except (ArithmeticError, ValueError):
+            return None
+        return value if value.is_finite() else None
 
     def _min_child_quantity(self) -> Decimal:
         """Smallest child the venue accepts: min notional at the current mid,
@@ -697,6 +770,16 @@ class PerpMMController(ControllerBase):
             trading_pairs=[self.config.trading_pair],
         )
         keep: set[str] = set()
+
+        if (self._quote_suspension_reason and intent_is_quoting(self._client.last_intent)
+                and self._quote_liveness.allow_quotes(self.market_data_provider.time())):
+            # Cancel-only: stop quote executors, create nothing, and leave any
+            # running close alone. An already-open liveness circuit falls
+            # through to its own failsafe below; it never creates quotes.
+            self._quote_liveness.suspend()
+            self._quote_refresh_pending = False
+            return [StopExecutorAction(controller_id=self.config.id, executor_id=e.id)
+                    for e in active if self._is_quote_executor(e)]
 
         max_data_age = getattr(self.config, "max_market_data_age_s", None)
         if (max_data_age is not None and intent_is_quoting(self._client.last_intent)
@@ -1025,4 +1108,7 @@ class PerpMMController(ControllerBase):
             "venue_circuit": self._venue_circuit.snapshot(now),
             "quote_refresh_reason": getattr(self, "_last_quote_refresh_reason", None),
             "quote_cancel_to_inactive_s": getattr(self, "_last_cancel_latency_s", None),
+            "equity_resolved": self._equity_resolved,
+            "peak_equity_seeded": self._peak_equity_seeded(),
+            "quote_suspension_reason": self._quote_suspension_reason,
         }
