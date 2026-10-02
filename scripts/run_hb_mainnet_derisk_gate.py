@@ -344,6 +344,7 @@ async def main() -> int:
             trading_pair=PAIR, venue="hyperliquid", account_id=args.account_id, leverage=1,
             # caps below the opened size: the keeper's own RiskPolicy must say DE_RISK
             max_position=args.open_size / 4, critical_position=args.open_size / 2,
+            max_market_data_age_s=15.0,
             decision_log_path=str(artifact_dir / "decisions.jsonl"),
         )
         controller = PerpMMController(config, provider, asyncio.Queue(), update_interval=args.cycle_s)

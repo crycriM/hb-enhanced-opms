@@ -359,6 +359,7 @@ async def main() -> int:
             leverage=1,
             max_position=args.max_position,
             critical_position=args.max_position * 2,
+            max_market_data_age_s=15.0,
             decision_log_path=str(artifact_dir / "decisions.jsonl"),
         )
         controller = PerpMMController(config, provider, asyncio.Queue(), update_interval=5.0)

@@ -166,6 +166,7 @@ async def main() -> int:
             venue="hyperliquid",
             account_id=args.account_id,
             leverage=1,
+            max_market_data_age_s=15.0,
         )
         controller = PerpMMController(config, provider, asyncio.Queue(), update_interval=5.0)
         await controller.on_start()

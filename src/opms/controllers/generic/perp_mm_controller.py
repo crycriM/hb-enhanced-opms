@@ -118,7 +118,7 @@ class PerpMMControllerConfig(ControllerConfigBase):
     maker_fee_bps: float = 1.5
     min_edge_bps: float = Field(default=0.0, ge=0)
     quote_reprice_bps: float = Field(default=2.0, gt=0)
-    max_market_data_age_s: float | None = Field(default=None, gt=0)
+    max_market_data_age_s: float | None = Field(default=15.0, gt=0)
     widen_factor: float = 2.0
     max_position: float = 10.0
     critical_position: float = 20.0
@@ -210,6 +210,7 @@ class PerpMMController(ControllerBase):
             leverage=config.leverage,
             quote_size=config.quote_size,
             price_tick=config.price_tick,
+            max_market_data_age_s=config.max_market_data_age_s,
             caps=Caps(max_position=config.max_position, critical_position=config.critical_position),
             risk=RiskConfig(
                 margin_health_soft=config.margin_health_soft,

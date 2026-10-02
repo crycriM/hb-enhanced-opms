@@ -76,6 +76,7 @@ class TestFillObserverFillAccounting:
         keeper = Keeper(
             client=InProcessClient(),
             config=PerpPairConfig(coin="SOL", gamma=1.0, kappa=0.5,
+                                  max_market_data_age_s=15.0,
                                   caps=Caps(max_position=10.0, critical_position=20.0)),
         )
         await keeper._on_snapshot({"ts": time.time(), "mid": 100.0})
