@@ -2,7 +2,7 @@
 
 Hummingbot-based execution body: controllers, executors, and a Gateway bridge wired to the `mm_core` brain.
 
-OPMS is the execution layer of the [amm-solution](https://github.com/amm-solution) spot and perpetual market-making system. It sits between the `mm_core` decision engine (the "brain") and Hummingbot (the "body"), translating `ExecIntent` from Keeper into venue-agnostic order specs, running execution algorithms, and collecting fill-level analytics.
+OPMS is the execution layer of the [amm-solution](https://github.com/crycriM/amm-solution) spot and perpetual market-making system. It sits between the `mm_core` decision engine (the "brain") and Hummingbot (the "body"), translating `ExecIntent` from Keeper into venue-agnostic order specs, running execution algorithms, and collecting fill-level analytics.
 
 > Current run status, known issues, and required local patches live in [`status.md`](status.md), not here.
 
